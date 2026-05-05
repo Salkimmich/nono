@@ -33,11 +33,13 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 pub(crate) use env_sanitization::is_dangerous_env_var;
+#[cfg(target_os = "linux")]
+pub(crate) use env_sanitization::is_env_var_allowed;
 use env_sanitization::should_skip_env_var;
 pub(crate) use env_sanitization::validate_env_var_patterns;
 
@@ -209,6 +211,10 @@ pub struct ExecConfig<'a> {
     pub current_dir: &'a std::path::Path,
     /// Whether to suppress diagnostic output.
     pub no_diagnostics: bool,
+    /// Verbosity level from the CLI. Normal output suppresses redundant
+    /// diagnostics for command-policy denials; verbose output keeps the full
+    /// generic footer for debugging.
+    pub diagnostic_verbosity: u8,
     /// Threading context for fork safety validation.
     pub threading: ThreadingContext,
     /// Paths that are write-protected (signed instruction files).
@@ -243,6 +249,10 @@ pub struct ExecConfig<'a> {
     /// name or prefix pattern (e.g. `"GITHUB_*"`) are stripped even if they
     /// also appear in `allowed_env_vars`. Nono-injected credentials bypass this.
     pub denied_env_vars: Option<Vec<String>>,
+    /// Prepared ETI runtime. When present, the outer child gets shims on PATH
+    /// and an additional Linux execute-only Landlock gate.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub eti_runtime: Option<&'a crate::eti_runtime::PreparedEtiRuntime>,
 }
 
 #[derive(Clone, Copy)]
@@ -276,7 +286,7 @@ pub struct SupervisorConfig<'a> {
     /// Whether to allow http://localhost and http://127.0.0.1 URLs.
     pub open_url_allow_localhost: bool,
     /// Optional append-only audit recorder for supervisor events.
-    pub audit_recorder: Option<&'a Mutex<crate::audit_integrity::AuditRecorder>>,
+    pub audit_recorder: Option<Arc<Mutex<crate::audit_integrity::AuditRecorder>>>,
     /// Optional in-memory network/IPC audit events persisted into session metadata.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub network_audit_events: Option<&'a Mutex<Vec<nono::undo::NetworkAuditEvent>>>,
@@ -297,6 +307,9 @@ pub struct SupervisorConfig<'a> {
     /// Linux connect/bind seccomp notify policy mode.
     #[cfg(target_os = "linux")]
     pub linux_network_notify_mode: LinuxNetworkNotifyMode,
+    /// Prepared ETI runtime listener for command-policy shim requests.
+    #[cfg(target_os = "linux")]
+    pub eti_runtime: Option<&'a crate::eti_runtime::PreparedEtiRuntime>,
 }
 
 #[cfg(target_os = "linux")]
@@ -449,7 +462,8 @@ pub fn execute_supervised(
         && (config.capability_elevation
             || config.seccomp_proxy_fallback
             || config.af_unix_mediation.is_pathname()
-            || trust_interceptor.is_some());
+            || trust_interceptor.is_some()
+            || config.eti_runtime.is_some());
 
     #[cfg(not(target_os = "linux"))]
     let needs_child_ipc = supervisor.is_some();
@@ -634,6 +648,16 @@ pub fn execute_supervised(
     // the parent hardens itself immediately after fork and the child hardens
     // itself after sandbox/filter setup whenever procfs inspection is not
     // required.
+    #[cfg(target_os = "linux")]
+    if config.eti_runtime.is_some() {
+        let ret = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        if ret != 0 {
+            return Err(NonoError::SandboxInit(format!(
+                "Failed to set PR_SET_CHILD_SUBREAPER for ETI supervisor: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
 
     // PTY pair is prepared by the caller so sessions can be detached and
     // reattached independently of capability elevation.
@@ -719,12 +743,58 @@ pub fn execute_supervised(
                 unsafe { crate::pty_proxy::setup_child_pty(slave_fd) };
             }
 
+            #[cfg(target_os = "linux")]
+            let chdir_before_sandbox = config.eti_runtime.is_some();
+            #[cfg(not(target_os = "linux"))]
+            let chdir_before_sandbox = false;
+
+            if chdir_before_sandbox {
+                // ETI must preserve the shim's original cwd without turning it
+                // into an outer-session filesystem grant. Landlock still
+                // mediates later file access after the sandbox is applied.
+                // SAFETY: `current_dir_c` was prepared before fork and remains
+                // valid for the lifetime of the child. `chdir` is
+                // async-signal-safe.
+                let chdir_result = unsafe { libc::chdir(current_dir_c.as_ptr()) };
+                if chdir_result != 0 {
+                    const MSG: &[u8] = b"nono: failed to enter child working directory\n";
+                    // SAFETY: `write` and `_exit` are async-signal-safe and we're in
+                    // the post-fork child path where higher-level Rust APIs are unsafe.
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            MSG.as_ptr().cast::<libc::c_void>(),
+                            MSG.len(),
+                        );
+                        libc::_exit(126);
+                    }
+                }
+            }
+
             // Apply Landlock FIRST. Landlock's restrict_self() opens path fds
             // for rule creation, so it must run before seccomp-notify is installed.
             // (seccomp-notify traps ALL openat/openat2 syscalls, which would
             // intercept Landlock's own path opens and deadlock.)
             #[cfg(target_os = "linux")]
             {
+                if let Some(eti_runtime) = config.eti_runtime {
+                    if let Err(e) = eti_runtime.apply_outer_exec_gate() {
+                        let detail = format!(
+                            "nono: failed to apply ETI outer exec gate in supervised child: {}\n",
+                            e
+                        );
+                        let msg = detail.as_bytes();
+                        unsafe {
+                            libc::write(
+                                libc::STDERR_FILENO,
+                                msg.as_ptr().cast::<libc::c_void>(),
+                                msg.len(),
+                            );
+                            libc::_exit(126);
+                        }
+                    }
+                }
+
                 match Sandbox::apply(effective_caps) {
                     Ok(_fallback) => {}
                     Err(e) => {
@@ -926,20 +996,22 @@ pub fn execute_supervised(
             // Close inherited FDs (but keep stdin/stdout/stderr and supervisor socket)
             close_inherited_fds(max_fd, &child_keep_fds);
 
-            // SAFETY: `current_dir_c` was prepared before fork and remains valid
-            // for the lifetime of the child. `chdir` is async-signal-safe.
-            let chdir_result = unsafe { libc::chdir(current_dir_c.as_ptr()) };
-            if chdir_result != 0 {
-                const MSG: &[u8] = b"nono: failed to enter child working directory\n";
-                // SAFETY: `write` and `_exit` are async-signal-safe and we're in
-                // the post-fork child path where higher-level Rust APIs are unsafe.
-                unsafe {
-                    libc::write(
-                        libc::STDERR_FILENO,
-                        MSG.as_ptr().cast::<libc::c_void>(),
-                        MSG.len(),
-                    );
-                    libc::_exit(126);
+            if !chdir_before_sandbox {
+                // SAFETY: `current_dir_c` was prepared before fork and remains valid
+                // for the lifetime of the child. `chdir` is async-signal-safe.
+                let chdir_result = unsafe { libc::chdir(current_dir_c.as_ptr()) };
+                if chdir_result != 0 {
+                    const MSG: &[u8] = b"nono: failed to enter child working directory\n";
+                    // SAFETY: `write` and `_exit` are async-signal-safe and we're in
+                    // the post-fork child path where higher-level Rust APIs are unsafe.
+                    unsafe {
+                        libc::write(
+                            libc::STDERR_FILENO,
+                            MSG.as_ptr().cast::<libc::c_void>(),
+                            MSG.len(),
+                        );
+                        libc::_exit(126);
+                    }
                 }
             }
 
@@ -1192,16 +1264,23 @@ pub fn execute_supervised(
             };
 
             // Analyze PTY screen content for sandbox-related errors.
-            let error_observation = pty_proxy
+            let pty_screen = pty_proxy
                 .as_ref()
-                .map(|p| {
-                    nono::diagnostic::analyze_error_output(
-                        &p.screen_plaintext(),
-                        config.protected_paths,
-                        Some(config.current_dir),
-                    )
-                })
+                .map(crate::pty_proxy::PtyProxy::screen_plaintext)
                 .unwrap_or_default();
+            let error_observation = if pty_screen.is_empty() {
+                nono::diagnostic::ErrorObservation::default()
+            } else {
+                nono::diagnostic::analyze_error_output(
+                    &pty_screen,
+                    config.protected_paths,
+                    Some(config.current_dir),
+                )
+            };
+            let eti_policy_denial = output_contains_eti_policy_denial(&pty_screen)
+                || config
+                    .eti_runtime
+                    .is_some_and(crate::eti_runtime::PreparedEtiRuntime::emitted_error_response);
 
             let mode = if supervisor.is_some() {
                 DiagnosticMode::Supervised
@@ -1239,6 +1318,9 @@ pub fn execute_supervised(
                 &ipc_denials,
                 &sandbox_violations,
                 &error_observation,
+            ) && !should_suppress_diagnostics_for_eti_denial(
+                config.diagnostic_verbosity,
+                eti_policy_denial,
             );
 
             // Print diagnostic footer on non-zero exit or when the PTY
@@ -1310,6 +1392,19 @@ pub fn execute_supervised(
         }
         Err(e) => Err(NonoError::SandboxInit(format!("fork() failed: {}", e))),
     }
+}
+
+fn output_contains_eti_policy_denial(output: &str) -> bool {
+    output
+        .lines()
+        .any(|line| line.trim_start().starts_with("nono: ETI denied "))
+}
+
+fn should_suppress_diagnostics_for_eti_denial(
+    diagnostic_verbosity: u8,
+    eti_policy_denial: bool,
+) -> bool {
+    diagnostic_verbosity == 0 && eti_policy_denial
 }
 
 /// Resolve policy explanations for denied paths by querying `query_path`.
@@ -2126,6 +2221,8 @@ fn run_supervisor_loop(
     let sock_fd = sock.as_raw_fd();
     let notify_raw_fd = seccomp_fd.map(|fd| fd.as_raw_fd());
     let proxy_notify_raw_fd = proxy_seccomp_fd.map(|fd| fd.as_raw_fd());
+    let eti_runtime = config.eti_runtime;
+    let eti_listener_fd = eti_runtime.map(|runtime| runtime.listener_fd());
     let mut rate_limiter = supervisor_linux::RateLimiter::new(10, 5);
     let mut denials = Vec::new();
     let mut ipc_denials = Vec::new();
@@ -2153,6 +2250,15 @@ fn run_supervisor_loop(
             let idx = pfds.len();
             pfds.push(libc::pollfd {
                 fd: pfd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            idx
+        });
+        let eti_idx = eti_listener_fd.map(|fd| {
+            let idx = pfds.len();
+            pfds.push(libc::pollfd {
+                fd,
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -2187,7 +2293,11 @@ fn run_supervisor_loop(
         match ret.cmp(&0) {
             std::cmp::Ordering::Greater => {
                 if sock_fd_active && pfds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    if notify_raw_fd.is_some() || proxy_notify_raw_fd.is_some() || pty.is_some() {
+                    if notify_raw_fd.is_some()
+                        || proxy_notify_raw_fd.is_some()
+                        || eti_listener_fd.is_some()
+                        || pty.is_some()
+                    {
                         debug!("Supervisor socket closed, continuing for seccomp/proxy/PTY");
                         sock_fd_active = false;
                     } else {
@@ -2214,6 +2324,7 @@ fn run_supervisor_loop(
                             debug!("Error receiving supervisor message: {}", e);
                             if notify_raw_fd.is_none()
                                 && proxy_notify_raw_fd.is_none()
+                                && eti_listener_fd.is_none()
                                 && pty.is_none()
                             {
                                 break;
@@ -2251,6 +2362,18 @@ fn run_supervisor_loop(
                     )
                 {
                     debug!("Error handling proxy seccomp notification: {}", e);
+                }
+
+                if let (Some(eti_idx), Some(runtime)) = (eti_idx, eti_runtime) {
+                    if pfds[eti_idx].revents & libc::POLLIN != 0 {
+                        if let Err(e) = runtime.handle_listener(
+                            child.as_raw() as u32,
+                            config.session_id,
+                            config.audit_recorder.clone(),
+                        ) {
+                            debug!("Error handling ETI shim request: {}", e);
+                        }
+                    }
                 }
 
                 if let Some(ref mut p) = pty
@@ -2653,7 +2776,7 @@ fn handle_supervisor_message(
                 error: error.clone(),
             };
             sock.send_response(&response)?;
-            if let Some(recorder_mutex) = config.audit_recorder {
+            if let Some(recorder_mutex) = config.audit_recorder.as_ref() {
                 let mut recorder = recorder_mutex
                     .lock()
                     .map_err(|_| NonoError::Snapshot("Audit recorder lock poisoned".to_string()))?;
@@ -2680,7 +2803,7 @@ fn record_capability_audit(
     decision_started: Instant,
     decision: ApprovalDecision,
 ) -> Result<()> {
-    if let Some(recorder_mutex) = config.audit_recorder {
+    if let Some(recorder_mutex) = config.audit_recorder.as_ref() {
         let entry = AuditEntry {
             timestamp: std::time::SystemTime::now(),
             request,
@@ -3361,6 +3484,26 @@ mod tests {
         ControlFlags, InputFlags, LocalFlags, OutputFlags, SpecialCharacterIndices,
     };
 
+    #[test]
+    fn test_output_contains_eti_policy_denial() {
+        assert!(output_contains_eti_policy_denial(
+            "nono: ETI denied git: Command 'git' is blocked: session_can_use missing\n"
+        ));
+        assert!(output_contains_eti_policy_denial(
+            "  nono: ETI denied ssh: Command 'ssh' is blocked: explicit_deny\n"
+        ));
+        assert!(!output_contains_eti_policy_denial(
+            "git: fatal: could not read from remote repository\n"
+        ));
+    }
+
+    #[test]
+    fn test_eti_policy_denial_suppresses_redundant_footer_only_at_normal_verbosity() {
+        assert!(should_suppress_diagnostics_for_eti_denial(0, true));
+        assert!(!should_suppress_diagnostics_for_eti_denial(1, true));
+        assert!(!should_suppress_diagnostics_for_eti_denial(0, false));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn test_linux_child_requires_dumpable_only_for_seccomp_driven_features() {
@@ -3805,6 +3948,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            eti_runtime: None,
         };
 
         // Fork a child that closes its socket end and exits immediately.
@@ -3919,6 +4063,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            eti_runtime: None,
         };
 
         match unsafe { fork() } {
@@ -4001,6 +4146,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            eti_runtime: None,
         };
 
         // Allowed origin: validation passes
@@ -4042,6 +4188,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            eti_runtime: None,
         };
 
         let result = validate_url("file:///etc/passwd", &config);
@@ -4081,6 +4228,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            eti_runtime: None,
         };
         let config_deny = SupervisorConfig {
             protected_roots: &[],
@@ -4102,6 +4250,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            eti_runtime: None,
         };
 
         // Localhost denied when not allowed
@@ -4146,6 +4295,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            eti_runtime: None,
         };
 
         let long_url = format!("https://example.com/{}", "a".repeat(MAX_URL_LENGTH));
@@ -4293,6 +4443,7 @@ mod tests {
             unix_socket_allowlist: &[],
             #[cfg(target_os = "linux")]
             linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+            eti_runtime: None,
         };
 
         assert!(

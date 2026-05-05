@@ -1365,6 +1365,7 @@ mod tests {
                 proxy_bind_ports,
                 unix_socket_allowlist,
                 linux_network_notify_mode: LinuxNetworkNotifyMode::ProxyOnly,
+                eti_runtime: None,
             }
         }
 
