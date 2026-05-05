@@ -448,6 +448,7 @@ fn prepare_profile_with_options(
             Some(profile_name),
             options.hook_output_silent,
         )?;
+        validate_command_policy_runtime_support(&profile)?;
         // If the profile was addressed by pack ref (e.g. --profile always-further/hermes),
         // ensure that pack is verified even if the profile JSON doesn't list it in `packs`.
         // Pack refs are injected into profile.packs at load time for every
