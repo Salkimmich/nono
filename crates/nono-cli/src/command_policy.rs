@@ -219,6 +219,46 @@ pub enum CommandCredentialType {
     RawFile,
 }
 
+/// Action to take when an [`InterceptRuleConfig`] matches.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InterceptActionConfig {
+    /// Fork the child and stream stdio normally (default when no rule matches).
+    #[default]
+    Passthrough,
+    /// Return `stdout` to the shim immediately; no child is forked; exit code 0.
+    Respond {
+        /// Static stdout payload returned to the caller.
+        stdout: String,
+    },
+    /// Fork the child, capture its stdout/stderr, and return the buffered output
+    /// in the shim response. Primary use: credential-bearing output scanned by
+    /// the token broker before reaching the agent.
+    Capture,
+    /// Block and route through `ApprovalBackend` before forking the child.
+    /// On denial the shim receives an error response; no child is forked.
+    Approve {
+        /// Per-rule approval timeout. `None` uses the global default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+    },
+}
+
+/// A sub-command mediation rule on a [`CommandPolicyConfig`].
+///
+/// Rules are evaluated in order; the first match wins. An empty `args` list
+/// is a catch-all and must appear last in the list. If no rule matches the
+/// default action is `Passthrough`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InterceptRuleConfig {
+    /// Argument prefix to match against argv[1..] of the shim invocation.
+    /// An empty list is a catch-all.
+    pub args: Vec<String>,
+    /// Action to take when this rule matches.
+    #[serde(default)]
+    pub action: InterceptActionConfig,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CommandPolicyConfig {
@@ -234,6 +274,8 @@ pub struct CommandPolicyConfig {
     pub allow_direct_exec_bypass: Vec<String>,
     #[serde(default)]
     pub allow_direct_exec_bypass_with_credentials: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intercept: Vec<InterceptRuleConfig>,
 }
 
 impl CommandPolicyConfig {
@@ -259,6 +301,18 @@ impl CommandPolicyConfig {
             allow_direct_exec_bypass_with_credentials: self
                 .allow_direct_exec_bypass_with_credentials
                 || child.allow_direct_exec_bypass_with_credentials,
+            // Parent intercept rules fire first. Child rules are appended after.
+            // Parent catch-alls thus shadow any child rules that follow them,
+            // which is the correct monotonic-widening behaviour.
+            intercept: {
+                let mut rules = self.intercept.clone();
+                for child_rule in &child.intercept {
+                    if !rules.contains(child_rule) {
+                        rules.push(child_rule.clone());
+                    }
+                }
+                rules
+            },
         }
     }
 }
@@ -643,6 +697,39 @@ fn validate_command(
             }
             CommandFromConfig::Policy(policy) => {
                 validate_sandbox(command_name, caller, policy, config, scope, report);
+            }
+        }
+    }
+
+    validate_intercept_rules(command_name, &command.intercept, report);
+}
+
+fn validate_intercept_rules(
+    command_name: &str,
+    rules: &[InterceptRuleConfig],
+    report: &mut CommandPolicyValidationReport,
+) {
+    let mut saw_catch_all = false;
+    for (i, rule) in rules.iter().enumerate() {
+        if saw_catch_all {
+            report.error(
+                "intercept_rule_after_catch_all",
+                format!(
+                    "command '{command_name}' intercept rule {i} appears after a catch-all (empty args) rule"
+                ),
+            );
+        }
+        if rule.args.is_empty() {
+            saw_catch_all = true;
+        }
+        if let InterceptActionConfig::Respond { stdout } = &rule.action {
+            if stdout.len() > 1024 * 1024 {
+                report.error(
+                    "intercept_respond_stdout_too_large",
+                    format!(
+                        "command '{command_name}' intercept rule {i} respond stdout exceeds 1 MiB"
+                    ),
+                );
             }
         }
     }
@@ -1928,6 +2015,133 @@ mod tests {
                 .errors
                 .iter()
                 .any(|finding| finding.code == "credential_bypass_requires_opt_in")
+        );
+    }
+
+    // -- InterceptRuleConfig / InterceptActionConfig --
+
+    #[test]
+    fn intercept_action_default_is_passthrough() {
+        assert_eq!(InterceptActionConfig::default(), InterceptActionConfig::Passthrough);
+    }
+
+    #[test]
+    fn intercept_action_serde_roundtrip() {
+        let respond = InterceptActionConfig::Respond { stdout: "hello\n".to_string() };
+        let json = serde_json::to_string(&respond).expect("serialize");
+        let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(respond, back);
+
+        let approve = InterceptActionConfig::Approve { timeout_secs: Some(30) };
+        let json = serde_json::to_string(&approve).expect("serialize");
+        let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(approve, back);
+
+        let passthrough = InterceptActionConfig::Passthrough;
+        let json = serde_json::to_string(&passthrough).expect("serialize");
+        let back: InterceptActionConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(passthrough, back);
+    }
+
+    #[test]
+    fn intercept_rule_merge_child_appends_child_rules() {
+        let parent_rule = InterceptRuleConfig {
+            args: vec!["push".to_string()],
+            action: InterceptActionConfig::Approve { timeout_secs: None },
+        };
+        let child_rule = InterceptRuleConfig {
+            args: vec!["fetch".to_string()],
+            action: InterceptActionConfig::Passthrough,
+        };
+        let parent = CommandPolicyConfig {
+            intercept: vec![parent_rule.clone()],
+            ..Default::default()
+        };
+        let child = CommandPolicyConfig {
+            intercept: vec![child_rule.clone()],
+            ..Default::default()
+        };
+        let merged = parent.merge_child(&child);
+        assert_eq!(merged.intercept, vec![parent_rule, child_rule]);
+    }
+
+    #[test]
+    fn intercept_rule_merge_child_does_not_duplicate() {
+        let rule = InterceptRuleConfig {
+            args: vec!["push".to_string()],
+            action: InterceptActionConfig::Passthrough,
+        };
+        let parent = CommandPolicyConfig {
+            intercept: vec![rule.clone()],
+            ..Default::default()
+        };
+        let child = CommandPolicyConfig {
+            intercept: vec![rule.clone()],
+            ..Default::default()
+        };
+        let merged = parent.merge_child(&child);
+        assert_eq!(merged.intercept.len(), 1);
+    }
+
+    #[test]
+    fn validate_intercept_catch_all_must_be_last() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![
+                InterceptRuleConfig { args: vec![], action: InterceptActionConfig::Passthrough },
+                InterceptRuleConfig {
+                    args: vec!["push".to_string()],
+                    action: InterceptActionConfig::Approve { timeout_secs: None },
+                },
+            ];
+        }
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report.errors.iter().any(|f| f.code == "intercept_rule_after_catch_all"),
+            "expected intercept_rule_after_catch_all error"
+        );
+    }
+
+    #[test]
+    fn validate_intercept_catch_all_last_is_valid() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![
+                InterceptRuleConfig {
+                    args: vec!["push".to_string()],
+                    action: InterceptActionConfig::Approve { timeout_secs: None },
+                },
+                InterceptRuleConfig { args: vec![], action: InterceptActionConfig::Passthrough },
+            ];
+        }
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            !report.errors.iter().any(|f| f.code == "intercept_rule_after_catch_all"),
+            "unexpected intercept_rule_after_catch_all error"
+        );
+    }
+
+    #[test]
+    fn validate_intercept_respond_stdout_too_large() {
+        let mut config = active_git_config();
+        if let Some(git) = config.commands.get_mut("git") {
+            git.intercept = vec![InterceptRuleConfig {
+                args: vec![],
+                action: InterceptActionConfig::Respond {
+                    stdout: "x".repeat(1024 * 1024 + 1),
+                },
+            }];
+        }
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|f| f.code == "intercept_respond_stdout_too_large"),
+            "expected intercept_respond_stdout_too_large error"
         );
     }
 }

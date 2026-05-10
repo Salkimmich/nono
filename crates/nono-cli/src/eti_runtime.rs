@@ -214,6 +214,34 @@ mod linux {
     struct EtiShimResponse {
         exit_code: i32,
         error: Option<String>,
+        /// Captured stdout bytes for the `Capture` intercept action.
+        /// Empty for `Passthrough` and `Respond` actions.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        captured_stdout: Vec<u8>,
+        /// macOS Seatbelt extension tokens issued by the supervisor.
+        /// Empty on Linux; populated on macOS for per-command capability grants.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        extension_tokens: Vec<String>,
+    }
+
+    impl EtiShimResponse {
+        fn ok(exit_code: i32) -> Self {
+            Self {
+                exit_code,
+                error: None,
+                captured_stdout: Vec::new(),
+                extension_tokens: Vec::new(),
+            }
+        }
+
+        fn err(exit_code: i32, error: String) -> Self {
+            Self {
+                exit_code,
+                error: Some(error),
+                captured_stdout: Vec::new(),
+                extension_tokens: Vec::new(),
+            }
+        }
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -1092,6 +1120,37 @@ mod linux {
                 return Err(err);
             }
         };
+
+        // Resolve intercept action before consuming the active-count slot so
+        // that Respond can return without forking a child process.
+        let command_config = state.plan.config.commands.get(&request.command);
+        let intercept_action = command_config
+            .map(|cc| resolve_intercept_action(cc, &request.argv))
+            .unwrap_or(&crate::command_policy::InterceptActionConfig::Passthrough);
+
+        if let crate::command_policy::InterceptActionConfig::Respond { stdout } = intercept_action {
+            // Write the static payload to the shim's stdout fd, then respond.
+            let stdout_bytes = stdout.as_bytes();
+            use std::io::Write;
+            let mut stdout_file = std::fs::File::from(stdio.stdout);
+            if let Err(e) = stdout_file.write_all(stdout_bytes) {
+                // Non-fatal: log and continue to send the response.
+                debug!("ETI Respond: failed to write static stdout: {e}");
+            }
+            record_command_policy_audit(
+                audit_recorder.as_ref(),
+                &request,
+                session_id,
+                auth.peer_pid,
+                session_root_pid,
+                Some(&caller),
+                "respond",
+                None,
+                Some(0),
+            )?;
+            return Ok(0);
+        }
+
         let active = state.active_count.fetch_add(1, Ordering::SeqCst);
         if active >= MAX_ACTIVE_ETI_CHILDREN {
             state.active_count.fetch_sub(1, Ordering::SeqCst);
@@ -1327,6 +1386,41 @@ mod linux {
                 }
             }
         }
+    }
+
+    /// Resolve the intercept action for a shim invocation.
+    ///
+    /// Matches `argv[1..]` against the command policy's `intercept` rules in
+    /// order; the first matching prefix wins. An empty `args` list is a
+    /// catch-all. Returns `Passthrough` when no rule matches or the policy has
+    /// no intercept rules.
+    fn resolve_intercept_action<'a>(
+        command_config: &'a crate::command_policy::CommandPolicyConfig,
+        argv: &[Vec<u8>],
+    ) -> &'a crate::command_policy::InterceptActionConfig {
+        use crate::command_policy::InterceptActionConfig;
+
+        static PASSTHROUGH: InterceptActionConfig = InterceptActionConfig::Passthrough;
+
+        // argv[0] is the synthesised command name; match against argv[1..]
+        let shim_args: Vec<&[u8]> = argv.iter().skip(1).map(|v| v.as_slice()).collect();
+
+        for rule in &command_config.intercept {
+            if rule.args.is_empty() {
+                // catch-all
+                return &rule.action;
+            }
+            if shim_args.len() >= rule.args.len()
+                && rule
+                    .args
+                    .iter()
+                    .zip(shim_args.iter())
+                    .all(|(expected, actual)| expected.as_bytes() == *actual)
+            {
+                return &rule.action;
+            }
+        }
+        &PASSTHROUGH
     }
 
     fn caller_label(caller: &Caller) -> String {
@@ -2378,7 +2472,11 @@ mod linux {
         exit_code: i32,
         error: Option<String>,
     ) -> Result<()> {
-        write_frame(stream, &EtiShimResponse { exit_code, error })
+        let resp = match error {
+            None => EtiShimResponse::ok(exit_code),
+            Some(e) => EtiShimResponse::err(exit_code, e),
+        };
+        write_frame(stream, &resp)
     }
 
     fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
