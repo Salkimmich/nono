@@ -107,8 +107,9 @@ impl CredentialStore {
     ///
     /// The `tls_connector` is required for OAuth2 token exchange HTTPS calls.
     ///
-    /// Returns an error only for hard failures (keystore access errors,
-    /// config parse errors, non-UTF-8 values).
+    /// Returns an error only for hard failures (config parse errors,
+    /// non-UTF-8 values). Missing or inaccessible credentials are logged
+    /// as warnings and the route is skipped.
     pub fn load(routes: &[RouteConfig], tls_connector: &TlsConnector) -> Result<Self> {
         let mut credentials = HashMap::new();
         let mut oauth2_routes = HashMap::new();
@@ -136,8 +137,8 @@ impl CredentialStore {
                     }
                     Err(nono::NonoError::KeystoreAccess(msg)) => {
                         warn!(
-                            "Credential '{}' for route '{}' could not be loaded: {}. \
-                             Requests will proceed without credential injection.",
+                            "Credential '{}' not available for route '{}': {}. \
+                             Managed-credential requests on this route will be denied until the credential is available.",
                             key, normalized_prefix, msg
                         );
                         continue;
