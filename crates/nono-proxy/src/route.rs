@@ -245,12 +245,10 @@ impl RouteStore {
         })
     }
 
-    /// Look up the route prefix and loaded entry for a CONNECT-style
-    /// `host:port`. Returns `Some((prefix, route))` on a match.
+    /// Return the first route matching `host:port`, or `None`.
     ///
-    /// Used by the TLS-intercept CONNECT branch to map the agent's
-    /// `CONNECT api.openai.com:443` target back to a route prefix
-    /// (`"openai"`) so the credential store can be consulted.
+    /// Prefer [`lookup_all_by_upstream`](Self::lookup_all_by_upstream)
+    /// when multiple routes may share the same upstream.
     #[must_use]
     pub fn lookup_by_upstream(&self, host_port: &str) -> Option<(&str, &LoadedRoute)> {
         let normalised = host_port.to_lowercase();
@@ -263,20 +261,31 @@ impl RouteStore {
         })
     }
 
-    /// Returns `true` if the `host:port` matches a route that requires
-    /// TLS interception (has `credential_key`, `oauth2`, or non-empty
-    /// `endpoint_rules`).
-    ///
-    /// Used in the CONNECT dispatch path to choose between transparent
-    /// tunnelling, the existing 403, and the new intercept handler.
+    /// Return all routes whose upstream matches `host:port`.
     #[must_use]
-    pub fn has_intercept_route(&self, host_port: &str) -> bool {
-        self.lookup_by_upstream(host_port)
-            .is_some_and(|(_, route)| route.requires_intercept)
+    pub fn lookup_all_by_upstream(&self, host_port: &str) -> Vec<(&str, &LoadedRoute)> {
+        let normalised = host_port.to_lowercase();
+        self.routes
+            .iter()
+            .filter(|(_, route)| {
+                route
+                    .upstream_host_port
+                    .as_ref()
+                    .is_some_and(|hp| *hp == normalised)
+            })
+            .map(|(prefix, route)| (prefix.as_str(), route))
+            .collect()
     }
 
-    /// Return the set of normalised `host:port` strings for all route
-    /// upstreams. Uses pre-normalised values computed at load time.
+    /// Whether any route for `host:port` requires TLS interception.
+    #[must_use]
+    pub fn has_intercept_route(&self, host_port: &str) -> bool {
+        self.lookup_all_by_upstream(host_port)
+            .iter()
+            .any(|(_, route)| route.requires_intercept)
+    }
+
+    /// All unique upstream `host:port` strings across loaded routes.
     #[must_use]
     pub fn route_upstream_hosts(&self) -> std::collections::HashSet<String> {
         self.routes
@@ -357,8 +366,13 @@ fn build_tls_connector(
     client_key_path: Option<&str>,
 ) -> Result<tokio_rustls::TlsConnector> {
     let mut root_store = rustls::RootCertStore::empty();
-    // Always include system roots
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        if let Err(e) = root_store.add(cert) {
+            debug!("skipping unparseable native cert in route connector: {e}");
+        }
+    }
 
     // Add custom CA if provided
     if let Some(ca_path) = ca_path {
@@ -848,6 +862,74 @@ mod tests {
         assert!(hit.1.requires_intercept);
         assert!(hit.1.requires_managed_credential);
         assert!(store.lookup_by_upstream("api.example.com:443").is_none());
+    }
+
+    #[test]
+    fn test_lookup_all_by_upstream_returns_multiple_routes() {
+        let routes = vec![
+            RouteConfig {
+                prefix: "github_org_a".to_string(),
+                upstream: "https://github.com".to_string(),
+                credential_key: Some("env://GH_TOKEN_A".to_string()),
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: "Bearer {}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: Some("GH_TOKEN_A".to_string()),
+                endpoint_rules: vec![crate::config::EndpointRule {
+                    method: "*".to_string(),
+                    path: "/org-a/**".to_string(),
+                }],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+            },
+            RouteConfig {
+                prefix: "github_org_b".to_string(),
+                upstream: "https://github.com".to_string(),
+                credential_key: Some("env://GH_TOKEN_B".to_string()),
+                inject_mode: Default::default(),
+                inject_header: "Authorization".to_string(),
+                credential_format: "Bearer {}".to_string(),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: Some("GH_TOKEN_B".to_string()),
+                endpoint_rules: vec![crate::config::EndpointRule {
+                    method: "*".to_string(),
+                    path: "/org-b/**".to_string(),
+                }],
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                oauth2: None,
+            },
+        ];
+        let store = RouteStore::load(&routes).unwrap();
+
+        let all = store.lookup_all_by_upstream("github.com:443");
+        assert_eq!(all.len(), 2, "both routes share the same upstream");
+
+        let prefixes: Vec<&str> = all.iter().map(|(p, _)| *p).collect();
+        assert!(prefixes.contains(&"github_org_a"));
+        assert!(prefixes.contains(&"github_org_b"));
+
+        let (_, route_a) = all.iter().find(|(p, _)| *p == "github_org_a").unwrap();
+        assert!(route_a.endpoint_rules.is_allowed("GET", "/org-a/repo"));
+        assert!(!route_a.endpoint_rules.is_allowed("GET", "/org-b/repo"));
+
+        let (_, route_b) = all.iter().find(|(p, _)| *p == "github_org_b").unwrap();
+        assert!(route_b.endpoint_rules.is_allowed("GET", "/org-b/repo"));
+        assert!(!route_b.endpoint_rules.is_allowed("GET", "/org-a/repo"));
+
+        assert!(store.has_intercept_route("github.com:443"));
+        assert!(store.is_route_upstream("github.com:443"));
+        assert!(store.lookup_all_by_upstream("other.com:443").is_empty());
     }
 
     /// Self-signed CA for testing. Generated with:

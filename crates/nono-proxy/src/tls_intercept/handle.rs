@@ -1,28 +1,22 @@
 //! CONNECT-intercept entry point.
 //!
-//! Owns:
+//! Terminates TLS from the agent, reads the inner HTTP request, selects
+//! the matching route (by endpoint rules when multiple routes share an
+//! upstream), and forwards via [`crate::forward::forward_request`].
 //!
-//! 1. Sending `200 Connection Established` to the agent.
-//! 2. Driving the inner TLS handshake using the cert resolver from
-//!    [`super::CertCache`].
-//! 3. Reading one HTTP/1.1 request inside the TLS stream.
-//! 4. Endpoint-rule + phantom-token enforcement.
-//! 5. Calling [`crate::forward::forward_request`] with the route's L7
-//!    context so the same upstream pipeline is used as the reverse proxy.
-//!
-//! Every failure mode is hard-fail — a route that asked for L7 visibility
-//! never silently degrades to a transparent tunnel.
+//! Auth relies on the outer CONNECT `Proxy-Authorization`; inner requests
+//! are not required to carry a token. Every failure is hard-fail.
 
 use crate::audit;
 use crate::config::InjectMode;
 use crate::credential::CredentialStore;
 use crate::error::{ProxyError, Result};
+use crate::filter::ProxyFilter;
 use crate::forward::{self, AuditCtx, UpstreamScheme, UpstreamSpec, UpstreamStrategy};
 use crate::reverse;
 use crate::route::RouteStore;
 use crate::tls_intercept::acceptor;
 use crate::tls_intercept::cert_cache::CertCache;
-use crate::{filter::ProxyFilter, token};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -125,8 +119,7 @@ pub async fn handle_intercept_connect(stream: &mut TcpStream, ctx: InterceptCtx<
     Ok(())
 }
 
-/// Read one HTTP/1.1 request from the inner TLS stream, enforce endpoint
-/// rules + phantom token, and forward via the shared L7 pipeline.
+/// Parse one inner HTTP/1.1 request, select the route, and forward upstream.
 async fn forward_inner_request<S>(tls_stream: &mut S, ctx: &InterceptCtx<'_>) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -166,21 +159,60 @@ where
     let (method, path, version) = parse_request_line(first_line)?;
     debug!("tls_intercept: inner request {} {}", method, path);
 
-    // --- Look up the route by upstream host:port ---
+    // Select the route for this request. When multiple routes share
+    // the same upstream, pick the one whose endpoint_rules match;
+    // fall back to a catch-all route (empty rules) if no rules match.
     let host_port = format!("{}:{}", ctx.host.to_lowercase(), ctx.port);
-    let (service, route) = match ctx.route_store.lookup_by_upstream(&host_port) {
+    let candidates = ctx.route_store.lookup_all_by_upstream(&host_port);
+    if candidates.is_empty() {
+        warn!(
+            "tls_intercept: no route for {} after intercept handshake",
+            host_port
+        );
+        reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await?;
+        return Ok(());
+    }
+
+    let mut matched: Option<(&str, &crate::route::LoadedRoute)> = None;
+    let mut catch_all: Option<(&str, &crate::route::LoadedRoute)> = None;
+    for (prefix, route) in &candidates {
+        if route.endpoint_rules.is_empty() {
+            if catch_all.is_none() {
+                catch_all = Some((prefix, route));
+            }
+        } else if route.endpoint_rules.is_allowed(&method, &path) {
+            matched = Some((prefix, route));
+            break;
+        }
+    }
+    let (service, route) = match matched.or(catch_all) {
         Some(hit) => hit,
         None => {
-            // Shouldn't reach here — the dispatch path already confirmed
-            // a route match before invoking us. Treat as 502 defensively.
-            warn!(
-                "tls_intercept: no route for {} after intercept handshake",
-                host_port
+            let reason = format!(
+                "endpoint denied: {} {} (no route's endpoint_rules matched)",
+                method, path
             );
-            reverse::send_error_generic(tls_stream, 502, "Bad Gateway").await?;
+            warn!("tls_intercept: {}", reason);
+            audit::log_denied(
+                ctx.audit_log,
+                audit::ProxyMode::ConnectIntercept,
+                &audit::EventContext {
+                    denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
+                    ..audit::EventContext::default()
+                },
+                ctx.host,
+                ctx.port,
+                &reason,
+            );
+            reverse::send_error_generic(tls_stream, 403, "Forbidden").await?;
             return Ok(());
         }
     };
+    debug!(
+        "tls_intercept: selected route '{}' for {} {}",
+        service, method, path
+    );
+
     let cred = ctx.credential_store.get(service);
     let oauth2_route = ctx.credential_store.get_oauth2(service);
 
@@ -194,7 +226,7 @@ where
             ctx.audit_log,
             audit::ProxyMode::ConnectIntercept,
             &audit::EventContext {
-                route_id: ctx.route_id,
+                route_id: Some(service),
                 auth_mechanism: route.managed_auth_mechanism.clone(),
                 auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
                 managed_credential_active: Some(false),
@@ -211,80 +243,13 @@ where
         return Ok(());
     }
 
-    // --- L7 endpoint filtering ---
-    if !route.endpoint_rules.is_allowed(&method, &path) {
-        let reason = format!("endpoint denied: {} {}", method, path);
-        warn!("tls_intercept: {}", reason);
-        audit::log_denied(
-            ctx.audit_log,
-            audit::ProxyMode::ConnectIntercept,
-            &audit::EventContext {
-                route_id: Some(service),
-                managed_credential_active: Some(cred.is_some() || oauth2_route.is_some()),
-                injection_mode: cred.map(|c| match c.inject_mode {
-                    InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
-                    InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
-                    InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
-                    InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
-                }),
-                denial_category: Some(nono::undo::NetworkAuditDenialCategory::EndpointPolicy),
-                ..audit::EventContext::default()
-            },
-            ctx.host,
-            ctx.port,
-            &reason,
-        );
-        reverse::send_error_generic(tls_stream, 403, "Forbidden").await?;
-        return Ok(());
-    }
+    // Endpoint filtering already happened during route selection above.
+    // Routes with non-empty endpoint_rules only matched if the inner
+    // request was allowed; catch-all routes (empty rules) allow everything.
 
-    // --- Phantom-token validation for credentialed routes ---
-    if let Some(cred) = cred {
-        if let Err(e) = reverse::validate_phantom_token_for_mode(
-            &cred.proxy_inject_mode,
-            &header_bytes,
-            &path,
-            &cred.proxy_header_name,
-            cred.proxy_path_pattern.as_deref(),
-            cred.proxy_query_param_name.as_deref(),
-            ctx.session_token,
-        ) {
-            audit::log_denied(
-                ctx.audit_log,
-                audit::ProxyMode::ConnectIntercept,
-                &audit::EventContext {
-                    route_id: Some(service),
-                    auth_mechanism: Some(match cred.proxy_inject_mode {
-                        InjectMode::Header | InjectMode::BasicAuth => {
-                            nono::undo::NetworkAuditAuthMechanism::PhantomHeader
-                        }
-                        InjectMode::UrlPath => nono::undo::NetworkAuditAuthMechanism::PhantomPath,
-                        InjectMode::QueryParam => {
-                            nono::undo::NetworkAuditAuthMechanism::PhantomQuery
-                        }
-                    }),
-                    auth_outcome: Some(nono::undo::NetworkAuditAuthOutcome::Failed),
-                    managed_credential_active: Some(true),
-                    injection_mode: Some(match cred.inject_mode {
-                        InjectMode::Header => nono::undo::NetworkAuditInjectionMode::Header,
-                        InjectMode::UrlPath => nono::undo::NetworkAuditInjectionMode::UrlPath,
-                        InjectMode::QueryParam => nono::undo::NetworkAuditInjectionMode::QueryParam,
-                        InjectMode::BasicAuth => nono::undo::NetworkAuditInjectionMode::BasicAuth,
-                    }),
-                    denial_category: Some(
-                        nono::undo::NetworkAuditDenialCategory::AuthenticationFailed,
-                    ),
-                },
-                ctx.host,
-                ctx.port,
-                &e.to_string(),
-            );
-            reverse::send_error_generic(tls_stream, 401, "Unauthorized").await?;
-            return Ok(());
-        }
-    }
-    // L7-only routes have no inner-token check by design — the outer CONNECT
-    // Proxy-Authorization already proved the caller holds the session token.
+    // No inner-request auth check — the outer CONNECT Proxy-Authorization
+    // is sufficient. Any client-supplied auth header is stripped below so
+    // it doesn't leak upstream.
 
     // --- Path / credential transformation ---
     let transformed_path = if let Some(cred) = cred {
@@ -465,12 +430,6 @@ fn parse_request_line(line: &str) -> Result<(String, String, String)> {
         parts[1].to_string(),
         parts[2].to_string(),
     ))
-}
-
-/// Trim unused-arg warnings: `token` is used implicitly via `validate_phantom_token_for_mode`.
-#[allow(dead_code)]
-fn _suppress_token_dependency() {
-    let _ = token::constant_time_eq;
 }
 
 #[cfg(test)]
