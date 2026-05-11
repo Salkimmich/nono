@@ -735,14 +735,14 @@ pub(crate) fn prepare_profile_for_preflight(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     use crate::command_policy::{CommandPoliciesConfig, CommandPolicyConfig, CommandSandboxConfig};
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     use std::collections::BTreeMap;
     use std::fs;
     use tempfile::tempdir;
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     fn active_command_policy_profile() -> profile::Profile {
         profile::Profile {
             command_policies: Some(CommandPoliciesConfig {

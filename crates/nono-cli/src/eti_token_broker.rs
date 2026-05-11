@@ -8,8 +8,8 @@
 ///
 /// When an ETI child is launched, `resolve_env_entry` replaces nonce env-var
 /// values with their real counterparts immediately before `execve`. When a
-/// `Capture` action returns stdout to the agent, `scan_and_replace` redacts
-/// any nonce patterns found in the captured output.
+/// `Capture` action returns stdout to the agent, `scan_and_reissue` redacts
+/// any broker nonce or broker-held value found in the captured output.
 ///
 /// All stored values are zeroed on drop via the `zeroize` crate.
 use rand::RngExt;
@@ -39,7 +39,7 @@ impl TokenBroker {
     }
 
     /// Issue a nonce for `value`. Returns the nonce string. Subsequent calls to
-    /// `resolve_env_entry` or `scan_and_replace` with this nonce will return the
+    /// `resolve_env_entry` or `scan_and_reissue` with this nonce will return the
     /// real value.
     pub(crate) fn issue(&mut self, value: Vec<u8>) -> String {
         let mut raw = [0u8; 32];
@@ -70,15 +70,23 @@ impl TokenBroker {
         Some(out)
     }
 
-    /// Scan `input` for nonce patterns and issue fresh nonces for each one found,
-    /// returning the substituted buffer and the new nonce→real mapping.
+    /// Scan `input` for broker nonces or broker-held values and issue fresh
+    /// nonces for each one found, returning the substituted buffer.
     ///
     /// Used for `Capture` action output: a captured nonce is re-issued as a new
     /// nonce before the buffered response is sent to the agent, so the real value
     /// never appears in the agent's address space even in captured stdout.
     pub(crate) fn scan_and_reissue(&mut self, input: &[u8]) -> Vec<u8> {
-        // Fast path: if the input is too short to contain a nonce, return as-is.
-        if input.len() < NONCE_LEN {
+        // Fast path: if the input is too short to contain either a nonce or any
+        // stored secret value, return as-is.
+        let shortest_secret = self
+            .map
+            .values()
+            .filter(|value| !value.is_empty())
+            .map(|value| value.len())
+            .min();
+        let shortest_match = shortest_secret.map_or(NONCE_LEN, |len| len.min(NONCE_LEN));
+        if input.len() < shortest_match {
             return input.to_vec();
         }
 
@@ -102,10 +110,26 @@ impl TokenBroker {
                     }
                 }
             }
+
+            if let Some(real) = self.longest_secret_value_at(&input[i..]) {
+                let new_nonce = self.issue(real.clone());
+                out.extend_from_slice(new_nonce.as_bytes());
+                i += real.len();
+                continue;
+            }
+
             out.push(input[i]);
             i = i.saturating_add(1);
         }
         out
+    }
+
+    fn longest_secret_value_at(&self, input: &[u8]) -> Option<Vec<u8>> {
+        self.map
+            .values()
+            .filter(|value| !value.is_empty() && input.starts_with(value.as_slice()))
+            .max_by_key(|value| value.len())
+            .map(|value| value.to_vec())
     }
 }
 
@@ -122,6 +146,31 @@ fn is_nonce(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn as_utf8(bytes: &[u8]) -> &str {
+        match std::str::from_utf8(bytes) {
+            Ok(value) => value,
+            Err(err) => panic!("test output must be UTF-8: {err}"),
+        }
+    }
+
+    fn find_nonce(value: &str) -> &str {
+        let Some(start) = value.find(NONCE_PREFIX) else {
+            panic!("test output must contain a broker nonce");
+        };
+        let end = start.saturating_add(NONCE_LEN);
+        if end > value.len() {
+            panic!("test output contains a truncated broker nonce");
+        }
+        &value[start..end]
+    }
+
+    fn resolve_entry(broker: &TokenBroker, entry: &[u8]) -> Vec<u8> {
+        match broker.resolve_env_entry(entry) {
+            Some(value) => value,
+            None => panic!("broker nonce must resolve"),
+        }
+    }
+
     #[test]
     fn issue_and_resolve_env_entry() {
         let mut broker = TokenBroker::new();
@@ -130,9 +179,7 @@ mod tests {
         assert!(is_nonce(&nonce), "issued nonce must be well-formed");
 
         let entry = format!("MY_SECRET={nonce}").into_bytes();
-        let resolved = broker
-            .resolve_env_entry(&entry)
-            .expect("nonce should resolve");
+        let resolved = resolve_entry(&broker, &entry);
         assert_eq!(resolved, b"MY_SECRET=hunter2");
     }
 
@@ -159,7 +206,7 @@ mod tests {
 
         let captured = format!("output contains {nonce} here").into_bytes();
         let result = broker.scan_and_reissue(&captured);
-        let result_str = std::str::from_utf8(&result).expect("utf8");
+        let result_str = as_utf8(&result);
 
         // The original nonce must be replaced with a fresh nonce
         assert!(
@@ -167,12 +214,43 @@ mod tests {
             "original nonce must not appear in output"
         );
         // But the fresh nonce is there and resolves to the same secret
-        let new_nonce_start = result_str.find(NONCE_PREFIX).expect("new nonce in output");
-        let new_nonce = &result_str[new_nonce_start..new_nonce_start + NONCE_LEN];
-        let resolved = broker
-            .resolve_env_entry(format!("X={new_nonce}").as_bytes())
-            .expect("new nonce resolves");
+        let new_nonce = find_nonce(result_str);
+        let resolved = resolve_entry(&broker, format!("X={new_nonce}").as_bytes());
         assert_eq!(resolved, b"X=s3cr3t");
+    }
+
+    #[test]
+    fn scan_and_reissue_replaces_real_secret_in_output() {
+        let mut broker = TokenBroker::new();
+        let secret = b"s3cr3t".to_vec();
+        let _nonce = broker.issue(secret.clone());
+
+        let captured = b"token=s3cr3t\n".to_vec();
+        let result = broker.scan_and_reissue(&captured);
+        let result_str = as_utf8(&result);
+
+        assert!(
+            !result
+                .windows(secret.len())
+                .any(|window| window == secret.as_slice()),
+            "real secret must not appear in output"
+        );
+        let new_nonce = find_nonce(result_str);
+        let resolved = resolve_entry(&broker, format!("X={new_nonce}").as_bytes());
+        assert_eq!(resolved, b"X=s3cr3t");
+    }
+
+    #[test]
+    fn scan_and_reissue_prefers_longest_secret_match() {
+        let mut broker = TokenBroker::new();
+        let _short = broker.issue(b"abc".to_vec());
+        let _long = broker.issue(b"abcdef".to_vec());
+
+        let result = broker.scan_and_reissue(b"abcdef");
+        let result_str = as_utf8(&result);
+        let new_nonce = &result_str[..NONCE_LEN];
+        let resolved = resolve_entry(&broker, format!("X={new_nonce}").as_bytes());
+        assert_eq!(resolved, b"X=abcdef");
     }
 
     #[test]

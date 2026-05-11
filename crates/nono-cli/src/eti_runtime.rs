@@ -479,6 +479,24 @@ mod linux {
             ]
         }
 
+        pub(crate) fn broker_secret_env_vars(
+            &self,
+            secrets: &[nono::LoadedSecret],
+        ) -> Result<Vec<(String, String)>> {
+            let mut broker = self.inner.token_broker.lock().map_err(|_| {
+                NonoError::SandboxInit("ETI token broker lock poisoned".to_string())
+            })?;
+            Ok(secrets
+                .iter()
+                .map(|secret| {
+                    (
+                        secret.env_var.clone(),
+                        broker.issue(secret.value.as_bytes().to_vec()),
+                    )
+                })
+                .collect())
+        }
+
         pub(crate) fn grant_outer_caps(&self, caps: &mut CapabilitySet) -> Result<()> {
             caps.add_fs(FsCapability::new_dir(
                 &self.inner.shim_dir,
@@ -4166,6 +4184,19 @@ mod macos {
     const ETI_SOCKET_ENV: &str = "NONO_ETI_SOCKET";
     const ETI_SHIM_MARKER_ENV: &str = "NONO_ETI_SHIM";
 
+    const DEFAULT_ENV_ALLOW: &[&str] = &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "COLORTERM",
+        "LANG",
+        "LC_*",
+        "TZ",
+    ];
+
     // ── FFI ──────────────────────────────────────────────────────────────────
 
     unsafe extern "C" {
@@ -4403,6 +4434,24 @@ mod macos {
                 ),
                 (ETI_SHIM_MARKER_ENV.to_string(), "1".to_string()),
             ]
+        }
+
+        pub(crate) fn broker_secret_env_vars(
+            &self,
+            secrets: &[nono::LoadedSecret],
+        ) -> Result<Vec<(String, String)>> {
+            let mut broker = self.inner.token_broker.lock().map_err(|_| {
+                NonoError::SandboxInit("ETI token broker lock poisoned".to_string())
+            })?;
+            Ok(secrets
+                .iter()
+                .map(|secret| {
+                    (
+                        secret.env_var.clone(),
+                        broker.issue(secret.value.as_bytes().to_vec()),
+                    )
+                })
+                .collect())
         }
 
         /// Grants Seatbelt capabilities for shim dir execution, socket access,
@@ -4665,7 +4714,7 @@ mod macos {
         let auth = authenticate_shim(stream, state)?;
 
         // Deny-only blocked commands.
-        if state.plan.config.commands.get(&request.command).is_none() {
+        if !state.plan.config.commands.contains_key(&request.command) {
             record_command_policy_audit(
                 audit_recorder.as_ref(),
                 &request,
@@ -5280,11 +5329,16 @@ mod macos {
         request: &EtiShimRequest,
         policy: &CommandSandboxConfig,
     ) -> Result<Vec<Vec<u8>>> {
-        let allow = if let Some(env_config) = &policy.environment {
-            env_config.allow_vars.as_deref()
-        } else {
-            None
-        };
+        let allowed_patterns: Vec<String> = policy
+            .environment
+            .as_ref()
+            .and_then(|env| env.allow_vars.clone())
+            .unwrap_or_else(|| {
+                DEFAULT_ENV_ALLOW
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect()
+            });
 
         let mut result: Vec<Vec<u8>> = Vec::new();
         for entry in &request.env {
@@ -5299,7 +5353,13 @@ mod macos {
             if name_str.starts_with("NONO_") {
                 continue;
             }
-            if env_name_allowed(name_str, allow) {
+            if crate::exec_strategy::env_sanitization::is_dangerous_env_var(name_str) {
+                continue;
+            }
+            if crate::exec_strategy::env_sanitization::is_env_var_allowed(
+                name_str,
+                &allowed_patterns,
+            ) {
                 // Resolve broker nonces.
                 let broker = state.token_broker.lock().map_err(|_| {
                     NonoError::SandboxInit("ETI token broker lock poisoned".to_string())
@@ -5313,15 +5373,10 @@ mod macos {
             }
         }
 
-        // Inject set_vars from policy.
-        if let Some(env_config) = &policy.environment {
-            for (k, v) in &env_config.set_vars {
-                let mut entry = k.as_bytes().to_vec();
-                entry.push(b'=');
-                entry.extend_from_slice(v.as_bytes());
-                result.push(entry);
-            }
-        }
+        result.retain(|entry| !entry.starts_with(b"PATH="));
+        result.push(format!("PATH={}", state.shim_dir.display()).into_bytes());
+        inject_chaining_control_env(&mut result, state);
+        apply_environment_set_vars(&mut result, policy)?;
 
         // Inject resolved credentials.
         for cred_name in &policy.use_credentials {
@@ -5339,25 +5394,50 @@ mod macos {
         Ok(result)
     }
 
-    fn env_name_allowed(name: &str, allow: Option<&[String]>) -> bool {
-        let Some(allow) = allow else {
-            // No allow list configured — use safe default (empty env).
-            return false;
+    fn inject_chaining_control_env(env: &mut Vec<Vec<u8>>, state: &EtiState) {
+        let socket_prefix = format!("{ETI_SOCKET_ENV}=");
+        let marker_prefix = format!("{ETI_SHIM_MARKER_ENV}=");
+        env.retain(|entry| {
+            !entry.starts_with(socket_prefix.as_bytes())
+                && !entry.starts_with(marker_prefix.as_bytes())
+        });
+        env.push(format!("{ETI_SOCKET_ENV}={}", state.socket_path.display()).into_bytes());
+        env.push(format!("{ETI_SHIM_MARKER_ENV}=1").into_bytes());
+    }
+
+    fn apply_environment_set_vars(
+        env: &mut Vec<Vec<u8>>,
+        policy: &CommandSandboxConfig,
+    ) -> Result<()> {
+        let Some(environment) = &policy.environment else {
+            return Ok(());
         };
-        for pattern in allow {
-            if pattern == "*" {
-                return true;
+        for (name, value) in &environment.set_vars {
+            if name.is_empty()
+                || name == "PATH"
+                || name.starts_with("NONO_")
+                || name.contains('*')
+                || name.contains('=')
+                || name.as_bytes().contains(&0)
+                || value.as_bytes().contains(&0)
+            {
+                return Err(NonoError::ConfigParse(format!(
+                    "invalid ETI environment.set_vars entry '{name}'"
+                )));
             }
-            if let Some(prefix) = pattern.strip_suffix('*') {
-                if name.starts_with(prefix) {
-                    return true;
-                }
+            if crate::exec_strategy::env_sanitization::is_dangerous_env_var(name) {
+                return Err(NonoError::ConfigParse(format!(
+                    "ETI environment.set_vars rejects dangerous key '{name}'"
+                )));
             }
-            if pattern == name {
-                return true;
-            }
+            let prefix = format!("{name}=");
+            env.retain(|entry| !entry.starts_with(prefix.as_bytes()));
+            let mut entry = name.as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend(value.as_bytes());
+            env.push(entry);
         }
-        false
+        Ok(())
     }
 
     // ── Policy selection ──────────────────────────────────────────────────────
@@ -5603,7 +5683,7 @@ mod macos {
     ) -> Result<ShimIdentity> {
         let shim_path = runtime_dir.join(name);
         // Hard link so the shim has its own name (argv[0]) while sharing the binary.
-        if let Err(_) = fs::hard_link(shim_source, &shim_path) {
+        if fs::hard_link(shim_source, &shim_path).is_err() {
             // Fallback: copy (cross-device or unsupported FS).
             fs::copy(shim_source, &shim_path).map_err(|e| NonoError::ConfigWrite {
                 path: shim_path.clone(),
@@ -5732,6 +5812,136 @@ mod macos {
     fn is_tty(fd: i32) -> bool {
         // SAFETY: isatty is async-signal-safe and always returns 0 or 1.
         unsafe { libc::isatty(fd) != 0 }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::command_policy::CommandEnvironmentConfig;
+
+        fn test_state() -> EtiState {
+            let runtime_dir = PathBuf::from("/tmp/nono-eti-test");
+            EtiState {
+                runtime_dir: runtime_dir.clone(),
+                socket_path: runtime_dir.join("supervisor.sock"),
+                shim_dir: runtime_dir.join("shims"),
+                workdir: PathBuf::from("/tmp"),
+                plan: ResolvedEtiPlan {
+                    config: CommandPoliciesConfig::default(),
+                    deny_only_commands: BTreeSet::new(),
+                },
+                shims_by_command: BTreeMap::new(),
+                shims_by_path: BTreeMap::new(),
+                credential_handles: BTreeMap::new(),
+                active_children: Mutex::new(HashMap::new()),
+                active_count: AtomicUsize::new(0),
+                queued_requests: AtomicUsize::new(0),
+                emitted_error_response: AtomicBool::new(false),
+                token_broker: Mutex::new(crate::eti_token_broker::TokenBroker::new()),
+                approval_backend: Arc::new(TerminalApproval),
+            }
+        }
+
+        fn request_with_env(env: Vec<Vec<u8>>) -> EtiShimRequest {
+            EtiShimRequest {
+                command: "git".to_string(),
+                argv: vec![b"git".to_vec()],
+                env,
+                cwd: b"/tmp".to_vec(),
+                stdio_tty: [false; 3],
+            }
+        }
+
+        fn policy_with_env(
+            allow_vars: Option<Vec<String>>,
+            set_vars: BTreeMap<String, String>,
+        ) -> CommandSandboxConfig {
+            CommandSandboxConfig {
+                environment: Some(CommandEnvironmentConfig {
+                    allow_vars,
+                    set_vars,
+                }),
+                ..CommandSandboxConfig::default()
+            }
+        }
+
+        fn contains_entry(env: &[Vec<u8>], expected: &[u8]) -> bool {
+            env.iter().any(|entry| entry.as_slice() == expected)
+        }
+
+        fn contains_prefix(env: &[Vec<u8>], prefix: &[u8]) -> bool {
+            env.iter().any(|entry| entry.starts_with(prefix))
+        }
+
+        #[test]
+        fn filter_child_env_uses_safe_default_and_chaining_env() -> Result<()> {
+            let state = test_state();
+            let request = request_with_env(vec![
+                b"PATH=/usr/bin".to_vec(),
+                b"HOME=/Users/test".to_vec(),
+                b"CUSTOM=value".to_vec(),
+                b"LD_PRELOAD=/evil.dylib".to_vec(),
+                b"NONO_ETI_SOCKET=/old.sock".to_vec(),
+            ]);
+
+            let env = filter_child_env(&state, &request, &CommandSandboxConfig::default())?;
+
+            assert!(contains_entry(&env, b"HOME=/Users/test"));
+            assert!(contains_entry(
+                &env,
+                format!("PATH={}", state.shim_dir.display()).as_bytes()
+            ));
+            assert!(contains_entry(
+                &env,
+                format!("{ETI_SOCKET_ENV}={}", state.socket_path.display()).as_bytes()
+            ));
+            assert!(contains_entry(
+                &env,
+                format!("{ETI_SHIM_MARKER_ENV}=1").as_bytes()
+            ));
+            assert!(!contains_prefix(&env, b"CUSTOM="));
+            assert!(!contains_prefix(&env, b"LD_PRELOAD="));
+            assert!(!contains_entry(&env, b"NONO_ETI_SOCKET=/old.sock"));
+
+            Ok(())
+        }
+
+        #[test]
+        fn filter_child_env_resolves_broker_nonces() -> Result<()> {
+            let state = test_state();
+            let nonce = {
+                let mut broker = state.token_broker.lock().map_err(|_| {
+                    NonoError::SandboxInit("ETI token broker lock poisoned".to_string())
+                })?;
+                broker.issue(b"s3cr3t".to_vec())
+            };
+            let nonce_entry = format!("API_TOKEN={nonce}").into_bytes();
+            let request = request_with_env(vec![nonce_entry.clone()]);
+            let policy = policy_with_env(Some(vec!["API_TOKEN".to_string()]), BTreeMap::new());
+
+            let env = filter_child_env(&state, &request, &policy)?;
+
+            assert!(contains_entry(&env, b"API_TOKEN=s3cr3t"));
+            assert!(!contains_entry(&env, &nonce_entry));
+
+            Ok(())
+        }
+
+        #[test]
+        fn apply_environment_set_vars_rejects_reserved_and_dangerous_names() {
+            let mut reserved = BTreeMap::new();
+            reserved.insert("NONO_ETI_SOCKET".to_string(), "/tmp/socket".to_string());
+            let reserved_policy = policy_with_env(None, reserved);
+            assert!(apply_environment_set_vars(&mut vec![], &reserved_policy).is_err());
+
+            let mut dangerous = BTreeMap::new();
+            dangerous.insert(
+                "DYLD_INSERT_LIBRARIES".to_string(),
+                "/evil.dylib".to_string(),
+            );
+            let dangerous_policy = policy_with_env(None, dangerous);
+            assert!(apply_environment_set_vars(&mut vec![], &dangerous_policy).is_err());
+        }
     }
 }
 

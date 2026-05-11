@@ -294,10 +294,13 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let eti_runtime: Option<crate::eti_runtime::PreparedEtiRuntime> = None;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let exec_resolved_program = eti_runtime
+    let eti_initial_shim = eti_runtime
         .as_ref()
         .and_then(|runtime| runtime.shim_for_initial_command(&command[0]))
-        .map(std::path::Path::to_path_buf)
+        .map(std::path::Path::to_path_buf);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let exec_resolved_program = eti_initial_shim
+        .clone()
         .unwrap_or_else(|| resolved_program.clone());
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let exec_resolved_program = resolved_program.clone();
@@ -320,8 +323,37 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
             "--audit-sign-key requires supervised execution".to_string(),
         ));
     }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if eti_runtime.is_some() && !loaded_secrets.is_empty() && eti_initial_shim.is_none() {
+        return Err(NonoError::ConfigParse(
+            "ETI brokered credentials require the initial command to run through an ETI shim; \
+             direct exec bypass cannot resolve broker tokens"
+                .to_string(),
+        ));
+    }
+
     apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let brokered_secret_env_vars = if let Some(runtime) = eti_runtime.as_ref() {
+        runtime.broker_secret_env_vars(&loaded_secrets)?
+    } else {
+        Vec::new()
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let mut env_vars: Vec<(&str, &str)> = if eti_runtime.is_some() {
+        brokered_secret_env_vars
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect()
+    } else {
+        loaded_secrets
+            .iter()
+            .map(|secret| (secret.env_var.as_str(), secret.value.as_str()))
+            .collect()
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let mut env_vars: Vec<(&str, &str)> = loaded_secrets
         .iter()
         .map(|secret| (secret.env_var.as_str(), secret.value.as_str()))
