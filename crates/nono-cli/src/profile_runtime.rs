@@ -125,11 +125,18 @@ fn verify_profile_packs(packs: &[String]) -> crate::Result<()> {
 
         let bundle_path = install_dir.join(".nono-trust.bundle");
         if bundle_path.exists() {
-            verify_stored_bundles(&install_dir, &bundle_path, pack_ref)?;
+            let pinned_signer = locked
+                .and_then(|p| p.provenance.as_ref())
+                .map(|prov| prov.signer_identity.as_str());
+            verify_stored_bundles(&install_dir, &bundle_path, pack_ref, pinned_signer)?;
         }
     }
 
     Ok(())
+}
+
+fn canonical_signer(uri: &str) -> &str {
+    uri.rsplit_once('@').map_or(uri, |(prefix, _)| prefix)
 }
 
 /// Re-verify each artifact's Sigstore bundle from the stored trust bundle file.
@@ -137,6 +144,7 @@ fn verify_stored_bundles(
     install_dir: &Path,
     bundle_path: &Path,
     pack_ref: &str,
+    pinned_signer: Option<&str>,
 ) -> crate::Result<()> {
     let bundle_content = std::fs::read_to_string(bundle_path).map_err(|e| {
         nono::NonoError::PackageInstall(format!(
@@ -212,6 +220,40 @@ fn verify_stored_bundles(
                 artifact_name, pack_ref, e, pack_ref
             ))
         })?;
+
+        // Check the verified signer identity against the lockfile pin.
+        // All artifacts in a pack share the same signer, so we check on each
+        // entry and fail fast on any mismatch.
+        if let Some(pinned) = pinned_signer {
+            let identity =
+                nono::trust::extract_signer_identity(&bundle, Path::new(artifact_name))?;
+            let verified_uri = match &identity {
+                nono::trust::SignerIdentity::Keyless {
+                    repository,
+                    workflow,
+                    git_ref,
+                    ..
+                } => format!("https://github.com/{repository}/{workflow}@{git_ref}"),
+                nono::trust::SignerIdentity::Keyed { key_id } => {
+                    format!("keyed:{key_id}")
+                }
+            };
+            // Strip @<git_ref> for canonical comparison — we pin repo+workflow,
+            // not the specific tag that triggered each release.
+            if canonical_signer(verified_uri.as_str()) != canonical_signer(pinned) {
+                return Err(nono::NonoError::PackageVerification {
+                    package: pack_ref.to_string(),
+                    reason: format!(
+                        "signer identity mismatch for '{}': bundle was signed by '{}' \
+                         but lockfile pins '{}'. Reinstall with: nono pull {} --force",
+                        artifact_name,
+                        verified_uri,
+                        pinned,
+                        pack_ref
+                    ),
+                });
+            }
+        }
     }
 
     Ok(())
@@ -328,7 +370,16 @@ fn prepare_profile_with_options(
             Some(profile_name),
             options.hook_output_silent,
         )?;
-        verify_profile_packs(&profile.packs)?;
+        // If the profile was addressed by pack ref (e.g. --profile always-further/hermes),
+        // ensure that pack is verified even if the profile JSON doesn't list it in `packs`.
+        let mut packs_to_verify = profile.packs.clone();
+        let pack_key = profile_name
+            .split_once('@')
+            .map_or(profile_name.as_str(), |(p, _)| p);
+        if profile::is_registry_ref(profile_name) && !packs_to_verify.contains(&pack_key.to_string()) {
+            packs_to_verify.push(pack_key.to_string());
+        }
+        verify_profile_packs(&packs_to_verify)?;
 
         if !profile.packs.is_empty() && !options.hook_output_silent {
             eprintln!("  Verified {} pack(s)", profile.packs.len());
