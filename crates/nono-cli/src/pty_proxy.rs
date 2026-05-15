@@ -68,9 +68,18 @@ const TERMINAL_RESTORE_NORMAL: &[u8] = concat!(
     "\x1b[?1005l\x1b[?1006l\x1b[?1015l", // disable mouse encodings
     "\x1b[?1004l", // disable focus events
     "\x1b[?2004l", // disable bracketed paste
-    "\x1b[?1l", // disable application cursor keys
-    "\x1b>",   // normal keypad mode
     "\x1b[?25h", // show cursor
+)
+.as_bytes();
+
+// DECCKM off + DECPNM: kept separate from TERMINAL_RESTORE_NORMAL because
+// writing these to the outer PTY inside a terminal multiplexer (tmux, GNU
+// screen, Zellij) corrupts the multiplexer's keyboard-mode tracking and
+// breaks extended-key delivery (e.g. ESC via CSI-u) for the running
+// application. Emitted only when the outer terminal is not a multiplexer.
+const KEYBOARD_MODE_RESET: &[u8] = concat!(
+    "\x1b[?1l", // disable application cursor keys
+    "\x1b>",    // normal keypad mode
 )
 .as_bytes();
 
@@ -1669,6 +1678,12 @@ fn recv_attach_resize_socket(stream: &UnixStream) -> Result<Option<UnixDatagram>
     Ok(Some(socket))
 }
 
+fn is_inside_multiplexer() -> bool {
+    std::env::var_os("TMUX").is_some()
+        || std::env::var_os("STY").is_some()
+        || std::env::var_os("ZELLIJ").is_some()
+}
+
 fn leave_attach_screen(in_alt_screen: bool) {
     let esc = if in_alt_screen {
         terminal_restore_escape(false)
@@ -1676,6 +1691,9 @@ fn leave_attach_screen(in_alt_screen: bool) {
         TERMINAL_RESTORE_NORMAL
     };
     let _ = write_all_fd(libc::STDOUT_FILENO, esc);
+    if !in_alt_screen && !is_inside_multiplexer() {
+        let _ = write_all_fd(libc::STDOUT_FILENO, KEYBOARD_MODE_RESET);
+    }
     drain_terminal_output(libc::STDOUT_FILENO);
 }
 
@@ -1691,6 +1709,9 @@ pub(crate) fn write_detach_terminal_reset(fd: RawFd, in_alt_screen: bool) {
         TERMINAL_RESTORE_NORMAL
     };
     let _ = write_all_fd(fd, esc);
+    if !in_alt_screen && !is_inside_multiplexer() {
+        let _ = write_all_fd(fd, KEYBOARD_MODE_RESET);
+    }
 }
 
 pub(crate) fn write_detach_notice(fd: RawFd) {
@@ -2397,9 +2418,9 @@ mod tests {
     use super::{
         ATTACH_HANDSHAKE_MAGIC, ATTACH_REQUEST_ATTACH, ATTACH_SCREEN_ENTER_ESCAPE,
         AltScreenTracker, AttachedClient, DEFAULT_DETACH_SEQUENCE, ERASE_NATIVE_SCROLLBACK,
-        PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_NORMAL, decode_attach_handshake,
-        encode_attach_request_frame, read_fd_once, select_attach_replay_bytes,
-        terminal_restore_escape, write_all_fd,
+        KEYBOARD_MODE_RESET, PtyProxy, ReadFdOutcome, ScreenState, TERMINAL_RESTORE_NORMAL,
+        decode_attach_handshake, encode_attach_request_frame, read_fd_once,
+        select_attach_replay_bytes, terminal_restore_escape, write_all_fd,
     };
     use nix::libc;
     use std::collections::VecDeque;
@@ -2480,6 +2501,32 @@ mod tests {
                 "normal-mode restore must still disable mouse mode {mode}"
             );
         }
+    }
+
+    #[test]
+    fn terminal_restore_normal_excludes_keyboard_mode_reset() {
+        let esc = std::str::from_utf8(TERMINAL_RESTORE_NORMAL).unwrap_or("");
+        assert!(
+            !esc.contains("\u{1b}[?1l"),
+            "TERMINAL_RESTORE_NORMAL must not contain DECCKM-off; use KEYBOARD_MODE_RESET separately"
+        );
+        assert!(
+            !esc.contains("\u{1b}>"),
+            "TERMINAL_RESTORE_NORMAL must not contain DECPNM; use KEYBOARD_MODE_RESET separately"
+        );
+    }
+
+    #[test]
+    fn keyboard_mode_reset_contains_decckm_and_decpnm() {
+        let esc = std::str::from_utf8(KEYBOARD_MODE_RESET).unwrap_or("");
+        assert!(
+            esc.contains("\u{1b}[?1l"),
+            "KEYBOARD_MODE_RESET must disable application cursor keys"
+        );
+        assert!(
+            esc.contains("\u{1b}>"),
+            "KEYBOARD_MODE_RESET must reset keypad to normal mode"
+        );
     }
 
     #[test]
