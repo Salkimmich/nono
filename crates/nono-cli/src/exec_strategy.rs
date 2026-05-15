@@ -2071,14 +2071,14 @@ fn run_supervisor_loop(
 ) -> Result<(WaitStatus, Vec<DenialRecord>)> {
     // Start the macOS ETI background listener thread (no-op if ETI not active).
     #[cfg(target_os = "macos")]
-    if let Some(eti_runtime) = config.eti_runtime {
-        if let Err(e) = eti_runtime.handle_listener(
+    if let Some(eti_runtime) = config.eti_runtime
+        && let Err(e) = eti_runtime.handle_listener(
             child.as_raw() as u32,
             config.session_id,
             config.audit_recorder.clone(),
-        ) {
-            debug!("ETI handle_listener error: {e}");
-        }
+        )
+    {
+        debug!("ETI handle_listener error: {e}");
     }
 
     let sock_fd = sock.as_raw_fd();

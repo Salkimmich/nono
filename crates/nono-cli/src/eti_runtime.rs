@@ -3026,10 +3026,10 @@ mod linux {
                 if dir.as_os_str().is_empty() || !dir.exists() {
                     continue;
                 }
-                if let Ok(canonical) = dir.canonicalize() {
-                    if canonical.is_dir() {
-                        dirs.insert(canonical);
-                    }
+                if let Ok(canonical) = dir.canonicalize()
+                    && canonical.is_dir()
+                {
+                    dirs.insert(canonical);
                 }
             }
         }
@@ -6409,10 +6409,10 @@ mod macos {
                 if dir.as_os_str().is_empty() || !dir.exists() {
                     continue;
                 }
-                if let Ok(canonical) = dir.canonicalize() {
-                    if canonical.is_dir() {
-                        dirs.insert(canonical);
-                    }
+                if let Ok(canonical) = dir.canonicalize()
+                    && canonical.is_dir()
+                {
+                    dirs.insert(canonical);
                 }
             }
         }
@@ -7158,18 +7158,24 @@ mod macos {
             add_outer_process_exec_gate(&mut caps, &state)?;
 
             let rules = caps.platform_rules();
-            assert!(!rules
-                .iter()
-                .any(|rule| rule.as_str() == "(deny process-exec*)"));
-            assert!(rules
-                .iter()
-                .any(|rule| rule.as_str() == "(deny file-read-data (literal \"/bin/echo\"))"));
+            assert!(
+                !rules
+                    .iter()
+                    .any(|rule| rule.as_str() == "(deny process-exec*)")
+            );
+            assert!(
+                rules
+                    .iter()
+                    .any(|rule| rule.as_str() == "(deny file-read-data (literal \"/bin/echo\"))")
+            );
             assert!(rules.iter().any(|rule| {
                 rule.as_str() == "(deny file-map-executable (literal \"/bin/echo\"))"
             }));
-            assert!(rules
-                .iter()
-                .any(|rule| rule.as_str() == "(deny process-exec* (literal \"/bin/echo\"))"));
+            assert!(
+                rules
+                    .iter()
+                    .any(|rule| rule.as_str() == "(deny process-exec* (literal \"/bin/echo\"))")
+            );
             Ok(())
         }
 

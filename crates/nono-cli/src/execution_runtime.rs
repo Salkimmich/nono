@@ -166,17 +166,17 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .as_ref()
         .is_some_and(crate::command_policy::CommandPoliciesConfig::is_active);
 
-    if !eti_active {
-        if let Some(blocked) = config::check_blocked_command(
+    if !eti_active
+        && let Some(blocked) = config::check_blocked_command(
             &program,
             caps.allowed_commands(),
             caps.blocked_commands(),
-        )? {
-            return Err(NonoError::BlockedCommand {
-                command: blocked,
-                reason: command_blocking_deprecation::BLOCKED_COMMAND_REASON.to_string(),
-            });
-        }
+        )?
+    {
+        return Err(NonoError::BlockedCommand {
+            command: blocked,
+            reason: command_blocking_deprecation::BLOCKED_COMMAND_REASON.to_string(),
+        });
     }
 
     let command: Vec<String> = std::iter::once(program.to_string_lossy().into_owned())
@@ -306,10 +306,10 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     let exec_resolved_program = resolved_program.clone();
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if let Some(runtime) = eti_runtime.as_ref() {
-        if let Some(err) = runtime.validate_initial_exec(&command[0], &resolved_program)? {
-            return Err(err);
-        }
+    if let Some(runtime) = eti_runtime.as_ref()
+        && let Some(err) = runtime.validate_initial_exec(&command[0], &resolved_program)?
+    {
+        return Err(err);
     }
 
     let executable_identity = if matches!(strategy, exec_strategy::ExecStrategy::Supervised) {

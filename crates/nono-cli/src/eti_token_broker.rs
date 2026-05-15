@@ -98,16 +98,15 @@ impl TokenBroker {
             // Look for the nonce prefix starting at i
             if input[i..].starts_with(prefix) && i + NONCE_LEN <= input.len() {
                 let candidate = &input[i..i + NONCE_LEN];
-                if let Ok(s) = std::str::from_utf8(candidate) {
-                    if is_nonce(s) {
-                        if let Some(real) = self.map.get(s).map(|v| v.to_vec()) {
-                            // Re-issue a fresh nonce for the real value
-                            let new_nonce = self.issue(real);
-                            out.extend_from_slice(new_nonce.as_bytes());
-                            i += NONCE_LEN;
-                            continue;
-                        }
-                    }
+                if let Ok(s) = std::str::from_utf8(candidate)
+                    && is_nonce(s)
+                    && let Some(real) = self.map.get(s).map(|v| v.to_vec())
+                {
+                    // Re-issue a fresh nonce for the real value
+                    let new_nonce = self.issue(real);
+                    out.extend_from_slice(new_nonce.as_bytes());
+                    i += NONCE_LEN;
+                    continue;
                 }
             }
 

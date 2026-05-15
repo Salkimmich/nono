@@ -507,7 +507,7 @@ pub(crate) fn validate_legacy_blocked_command_interactions(
     }
 
     report.activation = CommandPolicyActivation::Active;
-    validate_identifier_list("security.allowed_commands", allowed_commands, &mut report);
+    validate_identifier_list("commands.allow", allowed_commands, &mut report);
 
     let allowed: HashSet<&String> = allowed_commands.iter().collect();
     let mut deny_only_commands = BTreeSet::new();
@@ -520,7 +520,7 @@ pub(crate) fn validate_legacy_blocked_command_interactions(
             report.error(
                 "policy_blocked_command_conflict",
                 format!(
-                    "command '{command_name}' is both policy-controlled and legacy blocked; use allowed_commands to override the legacy blocked entry before ETI command-control resolution"
+                    "command '{command_name}' is both policy-controlled and legacy blocked; use commands.allow to override the legacy blocked entry before ETI command-control resolution"
                 ),
             );
             continue;
@@ -725,15 +725,13 @@ fn validate_intercept_rules(
         if rule.args.is_empty() {
             saw_catch_all = true;
         }
-        if let InterceptActionConfig::Respond { stdout } = &rule.action {
-            if stdout.len() > 1024 * 1024 {
-                report.error(
-                    "intercept_respond_stdout_too_large",
-                    format!(
-                        "command '{command_name}' intercept rule {i} respond stdout exceeds 1 MiB"
-                    ),
-                );
-            }
+        if let InterceptActionConfig::Respond { stdout } = &rule.action
+            && stdout.len() > 1024 * 1024
+        {
+            report.error(
+                "intercept_respond_stdout_too_large",
+                format!("command '{command_name}' intercept rule {i} respond stdout exceeds 1 MiB"),
+            );
         }
     }
 }
@@ -977,18 +975,18 @@ fn validate_resolved_references(
             continue;
         }
 
-        if let Some(command) = config.commands.get(command_name) {
-            if matches!(
+        if let Some(command) = config.commands.get(command_name)
+            && matches!(
                 command.from.get("session"),
                 Some(CommandFromConfig::Deny(value)) if value == "deny"
-            ) {
-                report.error(
-                    "contradictory_session_allow",
-                    format!(
-                        "session_can_use includes '{command_name}' but from.session is explicit deny"
-                    ),
-                );
-            }
+            )
+        {
+            report.error(
+                "contradictory_session_allow",
+                format!(
+                    "session_can_use includes '{command_name}' but from.session is explicit deny"
+                ),
+            );
         }
     }
 
@@ -1004,18 +1002,18 @@ fn validate_resolved_references(
                 continue;
             }
 
-            if let Some(callee_command) = config.commands.get(callee_name) {
-                if matches!(
+            if let Some(callee_command) = config.commands.get(callee_name)
+                && matches!(
                     callee_command.from.get(caller_name),
                     Some(CommandFromConfig::Deny(value)) if value == "deny"
-                ) {
-                    report.error(
-                        "contradictory_chained_allow",
-                        format!(
-                            "command '{caller_name}' can_use includes '{callee_name}' but {callee_name}.from.{caller_name} is explicit deny"
-                        ),
-                    );
-                }
+                )
+            {
+                report.error(
+                    "contradictory_chained_allow",
+                    format!(
+                        "command '{caller_name}' can_use includes '{callee_name}' but {callee_name}.from.{caller_name} is explicit deny"
+                    ),
+                );
             }
         }
     }
@@ -1713,14 +1711,14 @@ mod tests {
     #[test]
     fn merge_preserves_inherited_policy_and_appends_child_grants() {
         let mut base = active_git_config();
-        if let Some(git) = base.commands.get_mut("git") {
-            if let Some(sandbox) = &mut git.sandbox {
-                sandbox.argv_prepend = vec!["--base".to_string()];
-                sandbox.environment = Some(CommandEnvironmentConfig {
-                    allow_vars: Some(vec!["PATH".to_string()]),
-                    set_vars: BTreeMap::from([("GIT_SSH".to_string(), "ssh".to_string())]),
-                });
-            }
+        if let Some(git) = base.commands.get_mut("git")
+            && let Some(sandbox) = &mut git.sandbox
+        {
+            sandbox.argv_prepend = vec!["--base".to_string()];
+            sandbox.environment = Some(CommandEnvironmentConfig {
+                allow_vars: Some(vec!["PATH".to_string()]),
+                set_vars: BTreeMap::from([("GIT_SSH".to_string(), "ssh".to_string())]),
+            });
         }
         let child = CommandPoliciesConfig {
             commands: BTreeMap::from([(
