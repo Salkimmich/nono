@@ -1,0 +1,88 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "demo-k8s-prod-admin-approve",
+    "version": "1.0.0",
+    "description": "Demo: production kubectl admin access uses a separate kubeconfig and approval prompts for mutating operations."
+  },
+  "environment": {
+    "deny_vars": [
+      "KUBECONFIG",
+      "KUBE_CONFIG_PATH"
+    ]
+  },
+  "workdir": {
+    "access": "none"
+  },
+  "command_policies": {
+    "session_can_use": [
+      "kubectl"
+    ],
+    "commands": {
+      "kubectl": {
+        "sandbox": {
+          "fs_read_file": [
+            "/tmp/nono-demo/kube/prod-admin-kubeconfig"
+          ],
+          "network": {
+            "tcp_connect_ports": [
+              443,
+              6443
+            ]
+          },
+          "environment": {
+            "allow_vars": [
+              "PATH",
+              "HOME",
+              "TMPDIR",
+              "LANG",
+              "LC_*"
+            ],
+            "set_vars": {
+              "KUBECONFIG": "/tmp/nono-demo/kube/prod-admin-kubeconfig"
+            }
+          }
+        },
+        "intercept": [
+          {
+            "args": [
+              "apply"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 30
+            }
+          },
+          {
+            "args": [
+              "delete"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 30
+            }
+          },
+          {
+            "args": [
+              "rollout",
+              "restart"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 30
+            }
+          },
+          {
+            "args": [
+              "scale"
+            ],
+            "action": {
+              "type": "approve",
+              "timeout_secs": 30
+            }
+          }
+        ]
+      }
+    }
+  }
+}

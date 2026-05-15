@@ -1,0 +1,49 @@
+{
+  "extends": "default",
+  "meta": {
+    "name": "demo-k8s-prod-read",
+    "version": "1.0.0",
+    "description": "Demo: production kubectl read access uses a separate read-only kubeconfig."
+  },
+  "environment": {
+    "deny_vars": [
+      "KUBECONFIG",
+      "KUBE_CONFIG_PATH"
+    ]
+  },
+  "workdir": {
+    "access": "none"
+  },
+  "command_policies": {
+    "session_can_use": [
+      "kubectl"
+    ],
+    "commands": {
+      "kubectl": {
+        "sandbox": {
+          "fs_read_file": [
+            "/tmp/nono-demo/kube/prod-readonly-kubeconfig"
+          ],
+          "network": {
+            "tcp_connect_ports": [
+              443,
+              6443
+            ]
+          },
+          "environment": {
+            "allow_vars": [
+              "PATH",
+              "HOME",
+              "TMPDIR",
+              "LANG",
+              "LC_*"
+            ],
+            "set_vars": {
+              "KUBECONFIG": "/tmp/nono-demo/kube/prod-readonly-kubeconfig"
+            }
+          }
+        }
+      }
+    }
+  }
+}

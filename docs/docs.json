@@ -45,6 +45,7 @@
           "cli/features/profile-authoring",
           "cli/features/ephemeral-tool-isolation",
           "cli/features/eti-composable-witness",
+          "cli/features/eti-demo-scenarios",
           "cli/features/profile-introspection",
           "cli/features/environment"
         ]
