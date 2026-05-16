@@ -894,10 +894,6 @@
           "type": "array",
           "items": { "type": "integer", "minimum": 0, "maximum": 65535 },
           "description": "Raw TCP bind ports. Requires Landlock ABI v4+ TCP support."
-        },
-        "proxy_helper": {
-          "type": "string",
-          "description": "Nono-controlled helper/proxy mode used to make allow_domain enforceable."
         }
       }
     },
@@ -1110,10 +1106,6 @@
           "type": "array",
           "items": { "type": "integer", "minimum": 0, "maximum": 65535 },
           "description": "Raw TCP bind ports. Requires Landlock ABI v4+ TCP support."
-        },
-        "proxy_helper": {
-          "type": "string",
-          "description": "Nono-controlled helper/proxy mode used to make allow_domain enforceable."
         }
       }
     },

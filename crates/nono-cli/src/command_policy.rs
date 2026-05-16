@@ -393,8 +393,6 @@ pub struct CommandNetworkConfig {
     pub tcp_connect_ports: Vec<u16>,
     #[serde(default)]
     pub tcp_bind_ports: Vec<u16>,
-    #[serde(default)]
-    pub proxy_helper: Option<String>,
 }
 
 impl CommandNetworkConfig {
@@ -404,10 +402,6 @@ impl CommandNetworkConfig {
             allow_domain: dedup_append(&self.allow_domain, &child.allow_domain),
             tcp_connect_ports: dedup_append(&self.tcp_connect_ports, &child.tcp_connect_ports),
             tcp_bind_ports: dedup_append(&self.tcp_bind_ports, &child.tcp_bind_ports),
-            proxy_helper: child
-                .proxy_helper
-                .clone()
-                .or_else(|| self.proxy_helper.clone()),
         }
     }
 }
@@ -890,8 +884,7 @@ fn validate_network(
     if network.allow_all
         && (!network.allow_domain.is_empty()
             || !network.tcp_connect_ports.is_empty()
-            || !network.tcp_bind_ports.is_empty()
-            || network.proxy_helper.is_some())
+            || !network.tcp_bind_ports.is_empty())
     {
         report.error(
             "conflicting_network_policy",
@@ -905,16 +898,6 @@ fn validate_network(
         report.warning(
             "allow_all_network",
             format!("command '{command_name}' from.{caller} allows unrestricted child network"),
-        );
-    }
-
-    let proxy_helper = network.proxy_helper.as_deref().unwrap_or_default();
-    if !network.allow_domain.is_empty() && proxy_helper.is_empty() {
-        report.error(
-            "unenforceable_allow_domain",
-            format!(
-                "command '{command_name}' from.{caller} uses allow_domain without proxy_helper"
-            ),
         );
     }
 
@@ -1505,30 +1488,6 @@ mod tests {
                 .errors
                 .iter()
                 .any(|finding| finding.code == "ambiguous_session_policy")
-        );
-    }
-
-    #[test]
-    fn allow_domain_without_proxy_helper_is_invalid() {
-        let mut config = active_git_config();
-        if let Some(git) = config.commands.get_mut("git") {
-            git.sandbox = Some(CommandSandboxConfig {
-                network: Some(CommandNetworkConfig {
-                    allow_domain: vec!["github.com".to_string()],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-        }
-
-        let report =
-            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
-
-        assert!(
-            report
-                .errors
-                .iter()
-                .any(|finding| finding.code == "unenforceable_allow_domain")
         );
     }
 
