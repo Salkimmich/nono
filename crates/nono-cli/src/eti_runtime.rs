@@ -138,7 +138,6 @@ mod linux {
         policy_root: PathBuf,
         plan: ResolvedEtiPlan,
         shims_by_command: BTreeMap<String, ShimIdentity>,
-        shims_by_path: BTreeMap<PathBuf, String>,
         credential_handles: BTreeMap<String, ResolvedCredential>,
         allowed_outer_exec_files: Vec<PathBuf>,
         landlock_abi: nono::DetectedAbi,
@@ -390,14 +389,12 @@ mod linux {
 
             let start_shims = std::time::Instant::now();
             let mut shims_by_command = BTreeMap::new();
-            let mut shims_by_path = BTreeMap::new();
             let mut shim_names: BTreeSet<String> = plan.resolved.commands.keys().cloned().collect();
             shim_names.extend(plan.deny_only.keys().cloned());
             let shim_source = materialize_shim_source(&runtime_dir)?;
             let shim_count = shim_names.len();
             for name in shim_names {
                 let identity = materialize_shim(&shim_source, &runtime_dir, &name)?;
-                shims_by_path.insert(identity.path.clone(), name.clone());
                 shims_by_command.insert(name, identity);
             }
             eti_profile_log!(
@@ -432,7 +429,6 @@ mod linux {
                     policy_root: policy_root.to_path_buf(),
                     plan,
                     shims_by_command,
-                    shims_by_path,
                     credential_handles,
                     allowed_outer_exec_files,
                     landlock_abi,
@@ -754,9 +750,14 @@ mod linux {
         let socket_path = std::env::var_os(ETI_SOCKET_ENV)
             .map(PathBuf::from)
             .ok_or_else(|| NonoError::SandboxInit("ETI shim socket env missing".to_string()))?;
-        let command = std::env::current_exe()
-            .ok()
-            .and_then(|path| path.file_name().map(OsStr::to_os_string))
+        let shim_exe = std::env::current_exe().map_err(|err| {
+            NonoError::SandboxInit(format!(
+                "ETI shim failed to locate current executable: {err}"
+            ))
+        })?;
+        let command = shim_exe
+            .file_name()
+            .map(OsStr::to_os_string)
             .and_then(|name| name.into_string().ok())
             .ok_or_else(|| NonoError::SandboxInit("ETI shim command name invalid".to_string()))?;
         let start_env = std::time::Instant::now();
@@ -804,6 +805,7 @@ mod linux {
         })?;
         eti_profile_log!("shim:socket_connect: {:?}", start_connect.elapsed());
         let start_send = std::time::Instant::now();
+        send_shim_identity_fd(&stream, &shim_exe)?;
         write_frame(&mut stream, &request)?;
         send_stdio_fds(&stream)?;
         eti_profile_log!(
@@ -1100,15 +1102,11 @@ mod linux {
         session_id: &str,
         audit_recorder: Option<Arc<Mutex<AuditRecorder>>>,
     ) -> Result<(i32, Vec<u8>)> {
-        let auth = authenticate_shim(stream, state)?;
+        let peer_pid = peer_credentials(stream.as_raw_fd())?.pid;
+        let shim_fd = recv_fd_via_socket(stream.as_raw_fd())?;
         let request: EtiShimRequest = read_frame(stream)?;
         validate_ipc_request(&request)?;
-        if request.command != auth.command {
-            return Err(NonoError::SandboxInit(format!(
-                "ETI shim command mismatch: requested {}, authenticated {}",
-                request.command, auth.command
-            )));
-        }
+        let auth = authenticate_shim(peer_pid, shim_fd, &request.command, state)?;
         let stdio = recv_stdio_fds(stream)?;
 
         let caller = match resolve_caller(auth.peer_pid, session_root_pid, state) {
@@ -1372,29 +1370,27 @@ mod linux {
     }
 
     struct ShimAuth {
-        command: String,
         peer_pid: u32,
     }
 
-    fn authenticate_shim(stream: &UnixStream, state: &EtiState) -> Result<ShimAuth> {
-        let credentials = peer_credentials(stream.as_raw_fd())?;
-        let peer_pid = credentials.pid;
-        let exe_link = PathBuf::from(format!("/proc/{peer_pid}/exe"));
-        let metadata = fs::metadata(&exe_link).map_err(|err| NonoError::ConfigRead {
-            path: exe_link.clone(),
-            source: err,
-        })?;
-        let id = file_id(&metadata);
-        let exe_path = fs::read_link(&exe_link).map_err(|source| NonoError::ConfigRead {
-            path: exe_link.clone(),
-            source,
-        })?;
-        let command = state.shims_by_path.get(&exe_path).cloned().ok_or_else(|| {
+    fn authenticate_shim(
+        peer_pid: u32,
+        shim_fd: OwnedFd,
+        command: &str,
+        state: &EtiState,
+    ) -> Result<ShimAuth> {
+        let shim_file = File::from(shim_fd);
+        let metadata = shim_file.metadata().map_err(|err| {
             NonoError::SandboxInit(format!(
-                "ETI shim authentication failed for pid {peer_pid}: untrusted executable path {}",
-                exe_path.display()
+                "ETI shim authentication failed for pid {peer_pid}: fstat received shim fd failed: {err}"
             ))
         })?;
+        if !metadata.is_file() {
+            return Err(NonoError::SandboxInit(format!(
+                "ETI shim authentication failed for pid {peer_pid}: received shim fd is not a regular file"
+            )));
+        }
+        let id = file_id(&metadata);
         let identity = state.shims_by_command.get(&command).ok_or_else(|| {
             NonoError::SandboxInit(format!(
                 "ETI shim authentication failed for pid {peer_pid}: missing shim identity for {command}"
@@ -1402,11 +1398,18 @@ mod linux {
         })?;
         if identity.id != id {
             return Err(NonoError::SandboxInit(format!(
-                "ETI shim authentication failed for pid {peer_pid}: inode mismatch for {}",
-                exe_path.display()
+                "ETI shim authentication failed for pid {peer_pid}: inode mismatch for {command}"
             )));
         }
-        Ok(ShimAuth { command, peer_pid })
+        Ok(ShimAuth { peer_pid })
+    }
+
+    fn send_shim_identity_fd(stream: &UnixStream, shim_exe: &Path) -> Result<()> {
+        let shim_file = File::open(shim_exe).map_err(|source| NonoError::ConfigRead {
+            path: shim_exe.to_path_buf(),
+            source,
+        })?;
+        send_fd_via_socket(stream.as_raw_fd(), shim_file.as_raw_fd())
     }
 
     fn resolve_caller(peer_pid: u32, session_root_pid: u32, state: &EtiState) -> Result<Caller> {
@@ -4774,7 +4777,7 @@ mod macos {
         }
 
         /// Grants Seatbelt capabilities for shim dir execution, socket access,
-        /// and workdir read (so getcwd() works inside the sandbox).
+        /// and metadata-only cwd traversal so getcwd() works inside the sandbox.
         pub(crate) fn grant_outer_caps(&self, caps: &mut CapabilitySet) -> Result<()> {
             caps.add_fs(FsCapability::new_dir(
                 &self.inner.shim_dir,
@@ -4791,16 +4794,7 @@ mod macos {
                 &self.inner.socket_path,
                 AccessMode::Read,
             )?);
-            // Seatbelt's (deny default) blocks getcwd() if the shim's cwd is not
-            // reachable via file-read-metadata. Adding the workdir here ensures its
-            // ancestor chain gets file-read-metadata via collect_parent_dirs, so the
-            // shim can call getcwd() when the child process is in this directory.
-            if self.inner.policy_root != Path::new("/") {
-                caps.add_fs(FsCapability::new_dir(
-                    &self.inner.policy_root,
-                    AccessMode::Read,
-                )?);
-            }
+            add_macos_cwd_metadata_rules(caps, &self.inner.policy_root)?;
             add_outer_process_exec_gate(caps, &self.inner)?;
             caps.deduplicate();
             Ok(())
@@ -5691,6 +5685,16 @@ mod macos {
             &state.socket_path,
             AccessMode::Read,
         )?);
+        Ok(())
+    }
+
+    fn add_macos_cwd_metadata_rules(caps: &mut CapabilitySet, cwd: &Path) -> Result<()> {
+        for path in cwd.ancestors().filter(|path| *path != Path::new("/")) {
+            let escaped = crate::policy::escape_seatbelt_path(crate::policy::path_to_utf8(path)?)?;
+            caps.add_platform_rule(format!(
+                "(allow file-read-metadata (literal \"{escaped}\"))"
+            ))?;
+        }
         Ok(())
     }
 
@@ -7577,6 +7581,34 @@ mod macos {
                 path: link.to_path_buf(),
                 source,
             })
+        }
+
+        #[test]
+        fn outer_caps_grant_cwd_metadata_without_recursive_workdir_read() -> Result<()> {
+            let temp = test_tempdir()?;
+            let workdir = temp.path().join("workspace");
+            create_dir(&workdir)?;
+            let policy_root =
+                workdir
+                    .canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: workdir.clone(),
+                        source,
+                    })?;
+            let mut caps = CapabilitySet::new();
+            add_macos_cwd_metadata_rules(&mut caps, &policy_root)?;
+
+            assert!(
+                caps.fs_capabilities().is_empty(),
+                "cwd traversal must be represented as metadata-only platform rules, not filesystem read caps"
+            );
+
+            let escaped =
+                crate::policy::escape_seatbelt_path(crate::policy::path_to_utf8(&policy_root)?)?;
+            assert!(caps.platform_rules().contains(&format!(
+                "(allow file-read-metadata (literal \"{escaped}\"))"
+            )));
+            Ok(())
         }
 
         #[test]
