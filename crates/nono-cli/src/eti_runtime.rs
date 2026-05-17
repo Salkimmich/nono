@@ -27,6 +27,112 @@ pub(crate) fn record_main_start() {}
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) fn log_main_total() {}
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+static PASSTHROUGH_INTERCEPT_ACTION: crate::command_policy::InterceptActionConfig =
+    crate::command_policy::InterceptActionConfig::Passthrough;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ResolvedInterceptAction<'a> {
+    action: &'a crate::command_policy::InterceptActionConfig,
+    rule_args: Option<&'a [String]>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<'a> ResolvedInterceptAction<'a> {
+    fn passthrough() -> Self {
+        Self {
+            action: &PASSTHROUGH_INTERCEPT_ACTION,
+            rule_args: None,
+        }
+    }
+
+    fn rule_label(&self) -> String {
+        match self.rule_args {
+            Some([]) => "<catch-all>".to_string(),
+            Some(args) => args.join(" "),
+            None => "passthrough".to_string(),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_intercept_action<'a>(
+    command_config: &'a crate::command_policy::CommandPolicyConfig,
+    argv: &[Vec<u8>],
+) -> ResolvedInterceptAction<'a> {
+    // argv[0] is the synthesised command name; match against argv[1..].
+    let shim_args: Vec<&[u8]> = argv.iter().skip(1).map(|v| v.as_slice()).collect();
+
+    for rule in &command_config.intercept {
+        if rule.args.is_empty() {
+            return ResolvedInterceptAction {
+                action: &rule.action,
+                rule_args: Some(&rule.args),
+            };
+        }
+        if shim_args.len() >= rule.args.len()
+            && rule
+                .args
+                .iter()
+                .zip(shim_args.iter())
+                .all(|(expected, actual)| expected.as_bytes() == *actual)
+        {
+            return ResolvedInterceptAction {
+                action: &rule.action,
+                rule_args: Some(&rule.args),
+            };
+        }
+    }
+
+    ResolvedInterceptAction::passthrough()
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod intercept_tests {
+    use super::*;
+    use crate::command_policy::{CommandPolicyConfig, InterceptActionConfig, InterceptRuleConfig};
+
+    #[test]
+    fn resolve_intercept_action_tracks_matched_rule_label() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: vec!["push".to_string(), "--force".to_string()],
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![b"git".to_vec(), b"push".to_vec(), b"--force".to_vec()];
+
+        let resolved = resolve_intercept_action(&config, &argv);
+
+        assert_eq!(resolved.rule_label(), "push --force");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Approve { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_intercept_action_labels_catch_all_rule() {
+        let config = CommandPolicyConfig {
+            intercept: vec![InterceptRuleConfig {
+                args: Vec::new(),
+                action: InterceptActionConfig::Approve { timeout_secs: None },
+            }],
+            ..CommandPolicyConfig::default()
+        };
+        let argv = vec![b"git".to_vec(), b"status".to_vec()];
+
+        let resolved = resolve_intercept_action(&config, &argv);
+
+        assert_eq!(resolved.rule_label(), "<catch-all>");
+        assert!(matches!(
+            resolved.action,
+            InterceptActionConfig::Approve { .. }
+        ));
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use crate::audit_integrity::{AuditRecorder, CommandPolicyAuditEvent};
@@ -1166,9 +1272,10 @@ mod linux {
         // Resolve intercept action before consuming the active-count slot so
         // that Respond can return without forking a child process.
         let command_config = state.plan.config.commands.get(&request.command);
-        let intercept_action = command_config
-            .map(|cc| resolve_intercept_action(cc, &request.argv))
-            .unwrap_or(&crate::command_policy::InterceptActionConfig::Passthrough);
+        let intercept = command_config
+            .map(|cc| super::resolve_intercept_action(cc, &request.argv))
+            .unwrap_or_else(super::ResolvedInterceptAction::passthrough);
+        let intercept_action = intercept.action;
 
         if let crate::command_policy::InterceptActionConfig::Respond { stdout } = intercept_action {
             // Write the static payload to the shim's stdout fd, then respond.
@@ -1213,7 +1320,7 @@ mod linux {
                 command: request.command.clone(),
                 args: argv_display,
                 caller: caller_label(&caller),
-                intercept_rule: "approve".to_string(),
+                intercept_rule: intercept.rule_label(),
                 reason: None,
                 child_pid: auth.peer_pid,
                 session_id: session_id.to_string(),
@@ -1578,41 +1685,6 @@ mod linux {
                 }
             }
         }
-    }
-
-    /// Resolve the intercept action for a shim invocation.
-    ///
-    /// Matches `argv[1..]` against the command policy's `intercept` rules in
-    /// order; the first matching prefix wins. An empty `args` list is a
-    /// catch-all. Returns `Passthrough` when no rule matches or the policy has
-    /// no intercept rules.
-    fn resolve_intercept_action<'a>(
-        command_config: &'a crate::command_policy::CommandPolicyConfig,
-        argv: &[Vec<u8>],
-    ) -> &'a crate::command_policy::InterceptActionConfig {
-        use crate::command_policy::InterceptActionConfig;
-
-        static PASSTHROUGH: InterceptActionConfig = InterceptActionConfig::Passthrough;
-
-        // argv[0] is the synthesised command name; match against argv[1..]
-        let shim_args: Vec<&[u8]> = argv.iter().skip(1).map(|v| v.as_slice()).collect();
-
-        for rule in &command_config.intercept {
-            if rule.args.is_empty() {
-                // catch-all
-                return &rule.action;
-            }
-            if shim_args.len() >= rule.args.len()
-                && rule
-                    .args
-                    .iter()
-                    .zip(shim_args.iter())
-                    .all(|(expected, actual)| expected.as_bytes() == *actual)
-            {
-                return &rule.action;
-            }
-        }
-        &PASSTHROUGH
     }
 
     fn caller_label(caller: &Caller) -> String {
@@ -5193,7 +5265,8 @@ mod macos {
                 NonoError::SandboxInit(format!("missing command config for {}", request.command))
             })?;
 
-        let intercept_action = resolve_intercept_action(command_config, &request.argv);
+        let intercept = super::resolve_intercept_action(command_config, &request.argv);
+        let intercept_action = intercept.action;
 
         // ── Respond ──────────────────────────────────────────────────────────
         if let InterceptActionConfig::Respond { stdout } = intercept_action {
@@ -5230,7 +5303,7 @@ mod macos {
                 command: request.command.clone(),
                 args: argv_display,
                 caller: caller_label(&caller),
-                intercept_rule: "approve".to_string(),
+                intercept_rule: intercept.rule_label(),
                 reason: None,
                 child_pid: auth.peer_pid,
                 session_id: session_id.to_string(),
@@ -6665,30 +6738,6 @@ mod macos {
                 }
             }
         }
-    }
-
-    fn resolve_intercept_action<'a>(
-        config: &'a crate::command_policy::CommandPolicyConfig,
-        argv: &[Vec<u8>],
-    ) -> &'a InterceptActionConfig {
-        static PASSTHROUGH: InterceptActionConfig = InterceptActionConfig::Passthrough;
-        let args_tail: Vec<&[u8]> = argv.iter().skip(1).map(|a| a.as_slice()).collect();
-        for rule in &config.intercept {
-            if rule.args.is_empty() {
-                return &rule.action;
-            }
-            if args_tail.len() >= rule.args.len() {
-                let matches = rule
-                    .args
-                    .iter()
-                    .zip(args_tail.iter())
-                    .all(|(pat, arg)| arg == &pat.as_bytes());
-                if matches {
-                    return &rule.action;
-                }
-            }
-        }
-        &PASSTHROUGH
     }
 
     // ── Caller helpers ────────────────────────────────────────────────────────
