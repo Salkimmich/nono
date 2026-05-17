@@ -147,6 +147,8 @@ pub struct CommandPoliciesConfig {
     #[serde(default)]
     pub executable_dirs: Vec<String>,
     #[serde(default)]
+    pub allow_writable_executables: bool,
+    #[serde(default)]
     pub session_can_use: Vec<String>,
     #[serde(default)]
     pub credentials: BTreeMap<String, CommandCredentialConfig>,
@@ -163,6 +165,7 @@ impl CommandPoliciesConfig {
 
     fn has_non_command_fields(&self) -> bool {
         !self.executable_dirs.is_empty()
+            || self.allow_writable_executables
             || !self.session_can_use.is_empty()
             || !self.credentials.is_empty()
             || !self.deny_direct_exec_bypass.is_empty()
@@ -188,6 +191,8 @@ impl CommandPoliciesConfig {
 
         Self {
             executable_dirs: dedup_append(&self.executable_dirs, &child.executable_dirs),
+            allow_writable_executables: self.allow_writable_executables
+                || child.allow_writable_executables,
             session_can_use: dedup_append(&self.session_can_use, &child.session_can_use),
             credentials,
             commands,
@@ -475,6 +480,12 @@ pub(crate) fn validate_command_policies(
         &config.deny_direct_exec_bypass,
         &mut report,
     );
+    if config.allow_writable_executables {
+        report.warning(
+            "writable_executables_trust_downgrade",
+            "command_policies.allow_writable_executables disables ETI writable executable and parent-directory trust checks, including outer capability-set writability",
+        );
+    }
 
     for (name, credential) in &config.credentials {
         validate_credential(name, credential, &mut report);
@@ -2173,6 +2184,22 @@ mod tests {
     }
 
     #[test]
+    fn global_writable_executables_override_warns() {
+        let mut config = active_git_config();
+        config.allow_writable_executables = true;
+
+        let report =
+            validate_command_policies(Some(&config), CommandPolicyValidationScope::Resolved);
+
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|finding| { finding.code == "writable_executables_trust_downgrade" })
+        );
+    }
+
+    #[test]
     fn writable_executable_override_merges_monotonically() {
         let parent = CommandPolicyConfig {
             executable: Some("/usr/bin/git".to_string()),
@@ -2187,6 +2214,19 @@ mod tests {
 
         assert_eq!(merged.executable, Some("/usr/bin/git".to_string()));
         assert!(merged.allow_writable_executable);
+    }
+
+    #[test]
+    fn global_writable_executables_override_merges_monotonically() {
+        let parent = active_git_config();
+        let child = CommandPoliciesConfig {
+            allow_writable_executables: true,
+            ..Default::default()
+        };
+
+        let merged = parent.merge_child(&child);
+
+        assert!(merged.allow_writable_executables);
     }
 
     #[test]

@@ -61,6 +61,23 @@ ETI rejects executables and executable parent directories that are writable by t
 
 This is a per-command trust downgrade. It is rejected unless `executable` is set to an absolute file path; a relative path or a bare command name fails validation. It does not cover other binaries in that directory and does not change invocation: the agent still calls `demonator ...` through the ETI shim.
 
+For local demos or other low-assurance profiles that intentionally run from user-writable toolchains, a profile can disable the writable-executable trust check across ETI:
+
+```json
+{
+  "command_policies": {
+    "allow_writable_executables": true,
+    "commands": {
+      "npm": {
+        "executable": "/Users/alice/.nvm/versions/node/v24.13.0/bin/npm"
+      }
+    }
+  }
+}
+```
+
+This is broader than `commands.<name>.allow_writable_executable`: it also covers deny-only commands and the outer executable allow-list used by ETI, including paths writable through the sandbox's own outer capability set.
+
 Linux launches the verified executable object by file descriptor. macOS verifies the pinned file before sandboxing but must still call `execve()` by path, so a writable executable or parent directory remains replaceable before launch. Avoid `allow_writable_executable` for high-assurance macOS policies.
 
 Interpreter-packaged tools, such as a Python `aws` entrypoint, are classified as shebang scripts. ETI grants the selected script, its interpreter, and the interpreter's ELF loader closure. Language package directories, virtualenvs, SDK homes, and tool-specific data are not guessed by ETI; grant those explicitly with `fs_read`, `fs_read_file`, `fs_write`, or `fs_write_file`.

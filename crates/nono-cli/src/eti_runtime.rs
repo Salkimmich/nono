@@ -3243,10 +3243,11 @@ mod linux {
         outer_caps: &CapabilitySet,
     ) -> Result<()> {
         for (command_name, binary) in &resolved.commands {
-            let allow_writable_path = config
-                .commands
-                .get(command_name)
-                .is_some_and(command_allows_writable_executable);
+            let allow_writable_path = config.allow_writable_executables
+                || config
+                    .commands
+                    .get(command_name)
+                    .is_some_and(command_allows_writable_executable);
             validate_controlled_file(
                 &binary.canonical_path,
                 outer_caps,
@@ -3255,7 +3256,12 @@ mod linux {
             )?;
         }
         for entry in deny_only.values() {
-            validate_controlled_file(&entry.path, outer_caps, "deny-only command", false)?;
+            validate_controlled_file(
+                &entry.path,
+                outer_caps,
+                "deny-only command",
+                config.allow_writable_executables,
+            )?;
         }
         Ok(())
     }
@@ -3283,7 +3289,7 @@ mod linux {
         if !allow_writable_path {
             reject_user_writable_path(path, &metadata, label)?;
         }
-        if outer_caps_grant_write(outer_caps, path) {
+        if !allow_writable_path && outer_caps_grant_write(outer_caps, path) {
             return Err(NonoError::SandboxInit(format!(
                 "ETI {label} binary is writable by the outer session capability set: {}",
                 path.display()
@@ -3302,7 +3308,7 @@ mod linux {
         if !allow_writable_path {
             reject_user_writable_path(parent, &parent_metadata, "ETI executable parent directory")?;
         }
-        if outer_caps_grant_write(outer_caps, parent) {
+        if !allow_writable_path && outer_caps_grant_write(outer_caps, parent) {
             return Err(NonoError::SandboxInit(format!(
                 "ETI {label} binary is replaceable through writable parent directory: {}",
                 parent.display()
@@ -5836,12 +5842,23 @@ mod macos {
             &state.plan.executable_dirs,
             &controlled_ids,
             caps,
+            state.plan.config.allow_writable_executables,
         )?;
         for shim in state.shims_by_command.values() {
-            add_exact_outer_exec_path(&mut allowed, &shim.path, caps)?;
+            add_exact_outer_exec_path(
+                &mut allowed,
+                &shim.path,
+                caps,
+                state.plan.config.allow_writable_executables,
+            )?;
         }
         for bypass in &state.plan.allowed_direct_bypasses {
-            add_exact_outer_exec_path(&mut allowed, bypass, caps)?;
+            add_exact_outer_exec_path(
+                &mut allowed,
+                bypass,
+                caps,
+                state.plan.config.allow_writable_executables,
+            )?;
         }
         Ok(allowed.into_iter().collect())
     }
@@ -5851,6 +5868,7 @@ mod macos {
         dirs: &[PathBuf],
         controlled_ids: &HashSet<FileId>,
         caps: &CapabilitySet,
+        allow_writable_path: bool,
     ) -> Result<()> {
         for dir in dirs {
             let entries = fs::read_dir(dir).map_err(|source| NonoError::ConfigRead {
@@ -5875,7 +5893,12 @@ mod macos {
                 if controlled_ids.contains(&file_id(&metadata)) {
                     continue;
                 }
-                validate_controlled_file(&canonical, caps, "outer executable", false)?;
+                validate_controlled_file(
+                    &canonical,
+                    caps,
+                    "outer executable",
+                    allow_writable_path,
+                )?;
                 allowed.insert(canonical);
             }
         }
@@ -5886,6 +5909,7 @@ mod macos {
         allowed: &mut BTreeSet<PathBuf>,
         path: &Path,
         caps: &CapabilitySet,
+        allow_writable_path: bool,
     ) -> Result<()> {
         let canonical = path
             .canonicalize()
@@ -5900,7 +5924,7 @@ mod macos {
         if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
             return Err(NonoError::ExpectedFile(canonical));
         }
-        validate_controlled_file(&canonical, caps, "outer executable", false)?;
+        validate_controlled_file(&canonical, caps, "outer executable", allow_writable_path)?;
         allowed.insert(canonical);
         Ok(())
     }
@@ -6904,10 +6928,11 @@ mod macos {
         outer_caps: &CapabilitySet,
     ) -> Result<()> {
         for (command_name, binary) in &resolved.commands {
-            let allow_writable_path = config
-                .commands
-                .get(command_name)
-                .is_some_and(command_allows_writable_executable);
+            let allow_writable_path = config.allow_writable_executables
+                || config
+                    .commands
+                    .get(command_name)
+                    .is_some_and(command_allows_writable_executable);
             validate_controlled_file(
                 &binary.canonical_path,
                 outer_caps,
@@ -6916,7 +6941,12 @@ mod macos {
             )?;
         }
         for entry in deny_only.values() {
-            validate_controlled_file(&entry.path, outer_caps, "deny-only command", false)?;
+            validate_controlled_file(
+                &entry.path,
+                outer_caps,
+                "deny-only command",
+                config.allow_writable_executables,
+            )?;
         }
         Ok(())
     }
@@ -6944,7 +6974,7 @@ mod macos {
         if !allow_writable_path {
             reject_user_writable_path(path, &metadata, label)?;
         }
-        if outer_caps_grant_write(outer_caps, path) {
+        if !allow_writable_path && outer_caps_grant_write(outer_caps, path) {
             return Err(NonoError::SandboxInit(format!(
                 "ETI {label} binary is writable by the outer session capability set: {}",
                 path.display()
@@ -6967,7 +6997,7 @@ mod macos {
                 &format!("{label} executable parent directory for {}", path.display()),
             )?;
         }
-        if outer_caps_grant_write(outer_caps, parent) {
+        if !allow_writable_path && outer_caps_grant_write(outer_caps, parent) {
             return Err(NonoError::SandboxInit(format!(
                 "ETI {label} binary is replaceable through writable parent directory: {}",
                 parent.display()
@@ -7922,6 +7952,10 @@ mod macos {
                     .contains("policy command executable parent directory")
             );
 
+            config.allow_writable_executables = true;
+            validate_controlled_binary_immutability(&config, &resolved, &BTreeMap::new(), &caps)?;
+            config.allow_writable_executables = false;
+
             let command = config
                 .commands
                 .get_mut("tool")
@@ -7930,6 +7964,96 @@ mod macos {
             set_mode(&tool, 0o700)?;
 
             validate_controlled_binary_immutability(&config, &resolved, &BTreeMap::new(), &caps)?;
+
+            Ok(())
+        }
+
+        #[test]
+        fn global_writable_executables_override_allows_writable_outer_exec_paths() -> Result<()> {
+            let temp = test_tempdir()?;
+            let bin_dir = temp.path().join("bin");
+            let runtime_dir = temp.path().join("runtime");
+            create_dir(&bin_dir)?;
+            create_dir(&runtime_dir)?;
+
+            let non_controlled = bin_dir.join("env");
+            let shim = runtime_dir.join("git");
+            create_executable(&non_controlled)?;
+            create_executable(&shim)?;
+            set_mode(&bin_dir, 0o700)?;
+            set_mode(&runtime_dir, 0o700)?;
+
+            let mut state = test_state();
+            state.plan.executable_dirs =
+                vec![
+                    bin_dir
+                        .canonicalize()
+                        .map_err(|source| NonoError::PathCanonicalization {
+                            path: bin_dir.clone(),
+                            source,
+                        })?,
+                ];
+            state
+                .shims_by_command
+                .insert("git".to_string(), shim_identity(&shim)?);
+
+            let mut caps = CapabilitySet::new();
+            let err = add_outer_process_exec_gate(&mut caps, &state)
+                .err()
+                .ok_or_else(|| {
+                    NonoError::SandboxInit(
+                        "expected writable outer executable rejection".to_string(),
+                    )
+                })?;
+            assert!(err.to_string().contains("writable by the supervisor user"));
+
+            state.plan.config.allow_writable_executables = true;
+            let mut caps = CapabilitySet::new();
+            add_outer_process_exec_gate(&mut caps, &state)?;
+
+            let rules = caps.platform_rules();
+            assert!(
+                rules.contains(&exec_allow_rule(&non_controlled.canonicalize().map_err(
+                    |source| NonoError::PathCanonicalization {
+                        path: non_controlled.clone(),
+                        source,
+                    }
+                )?)?)
+            );
+            assert!(
+                rules.contains(&exec_allow_rule(&shim.canonicalize().map_err(
+                    |source| {
+                        NonoError::PathCanonicalization {
+                            path: shim.clone(),
+                            source,
+                        }
+                    }
+                )?)?)
+            );
+
+            set_mode(&non_controlled, 0o500)?;
+            set_mode(&shim, 0o500)?;
+            set_mode(&bin_dir, 0o500)?;
+            set_mode(&runtime_dir, 0o500)?;
+            state.plan.config.allow_writable_executables = false;
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(FsCapability::new_dir(&runtime_dir, AccessMode::ReadWrite)?);
+            let err = add_outer_process_exec_gate(&mut caps, &state)
+                .err()
+                .ok_or_else(|| {
+                    NonoError::SandboxInit(
+                        "expected outer capability-set executable rejection".to_string(),
+                    )
+                })?;
+            assert!(
+                err.to_string()
+                    .contains("writable by the outer session capability set")
+            );
+
+            state.plan.config.allow_writable_executables = true;
+            let mut caps = CapabilitySet::new();
+            caps.add_fs(FsCapability::new_dir(&runtime_dir, AccessMode::ReadWrite)?);
+            add_outer_process_exec_gate(&mut caps, &state)?;
 
             Ok(())
         }

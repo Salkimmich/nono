@@ -736,6 +736,10 @@
           "items": { "type": "string" },
           "description": "Additional directories searched during command target resolution before shim PATH is prepended."
         },
+        "allow_writable_executables": {
+          "type": "boolean",
+          "description": "Explicit profile-wide trust downgrade that disables ETI writable executable and parent-directory checks for policy, deny-only, and outer executable allow-list paths, including outer sandbox capability-set writability."
+        },
         "session_can_use": {
           "type": "array",
           "items": { "$ref": "#/$defs/CommandPolicyIdentifier" },
@@ -951,6 +955,10 @@
           "type": "array",
           "items": { "type": "string" },
           "description": "Additional directories searched during command target resolution before shim PATH is prepended."
+        },
+        "allow_writable_executables": {
+          "type": "boolean",
+          "description": "Explicit profile-wide trust downgrade that disables ETI writable executable and parent-directory checks for policy, deny-only, and outer executable allow-list paths, including outer sandbox capability-set writability."
         },
         "session_can_use": {
           "type": "array",
