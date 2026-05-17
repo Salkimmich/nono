@@ -165,6 +165,9 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
         .command_policies
         .as_ref()
         .is_some_and(crate::command_policy::CommandPoliciesConfig::is_active);
+    if eti_active {
+        validate_command_policy_execution_support()?;
+    }
 
     if !eti_active
         && let Some(blocked) = config::check_blocked_command(
@@ -516,6 +519,20 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
 }
 
+fn validate_command_policy_execution_support() -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err(NonoError::UnsupportedPlatform(
+            "ETI command_policies are only supported on Linux and macOS".to_string(),
+        ))
+    }
+}
+
 fn write_capability_state_file(
     caps: &CapabilitySet,
     bypass_protection_paths: &[std::path::PathBuf],
@@ -568,7 +585,7 @@ fn write_capability_state_file(
 mod tests {
     use super::{
         compute_executable_identity, recommended_builtin_profile, should_apply_startup_timeout,
-        startup_timeout_profile,
+        startup_timeout_profile, validate_command_policy_execution_support,
     };
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -637,5 +654,11 @@ mod tests {
             binary.canonicalize().expect("canonical")
         );
         assert_eq!(identity.sha256.as_bytes(), &<[u8; 32]>::from(expected));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn command_policy_execution_supported_on_current_platform() {
+        assert!(validate_command_policy_execution_support().is_ok());
     }
 }
