@@ -211,9 +211,7 @@ pub struct ExecConfig<'a> {
     pub current_dir: &'a std::path::Path,
     /// Whether to suppress diagnostic output.
     pub no_diagnostics: bool,
-    /// Verbosity level from the CLI. Normal output suppresses redundant
-    /// diagnostics for command-policy denials; verbose output keeps the full
-    /// generic footer for debugging.
+    /// Verbosity level from the CLI.
     pub diagnostic_verbosity: u8,
     /// Threading context for fork safety validation.
     pub threading: ThreadingContext,
@@ -1432,10 +1430,10 @@ fn output_contains_eti_policy_denial(output: &str) -> bool {
 }
 
 fn should_suppress_diagnostics_for_eti_denial(
-    diagnostic_verbosity: u8,
+    _diagnostic_verbosity: u8,
     eti_policy_denial: bool,
 ) -> bool {
-    diagnostic_verbosity == 0 && eti_policy_denial
+    eti_policy_denial
 }
 
 /// Resolve policy explanations for denied paths by querying `query_path`.
@@ -3576,9 +3574,9 @@ mod tests {
     }
 
     #[test]
-    fn test_eti_policy_denial_suppresses_redundant_footer_only_at_normal_verbosity() {
+    fn test_eti_policy_denial_suppresses_redundant_footer() {
         assert!(should_suppress_diagnostics_for_eti_denial(0, true));
-        assert!(!should_suppress_diagnostics_for_eti_denial(1, true));
+        assert!(should_suppress_diagnostics_for_eti_denial(1, true));
         assert!(!should_suppress_diagnostics_for_eti_denial(0, false));
     }
 

@@ -395,6 +395,8 @@ mod linux {
     #[derive(Debug, Serialize, Deserialize)]
     struct FsGrantSpec {
         path: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_path: Option<Vec<u8>>,
         access: String,
         is_file: bool,
     }
@@ -402,6 +404,8 @@ mod linux {
     #[derive(Debug, Serialize, Deserialize)]
     struct UnixSocketGrantSpec {
         path: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_path: Option<Vec<u8>>,
         mode: String,
         is_directory: bool,
     }
@@ -1498,7 +1502,7 @@ mod linux {
             )));
         }
         let id = file_id(&metadata);
-        let identity = state.shims_by_command.get(&command).ok_or_else(|| {
+        let identity = state.shims_by_command.get(command).ok_or_else(|| {
             NonoError::SandboxInit(format!(
                 "ETI shim authentication failed for pid {peer_pid}: missing shim identity for {command}"
             ))
@@ -3740,6 +3744,8 @@ mod linux {
                 .iter()
                 .map(|cap| FsGrantSpec {
                     path: cap.resolved.as_os_str().as_bytes().to_vec(),
+                    original_path: (cap.original.is_absolute() && cap.original != cap.resolved)
+                        .then(|| cap.original.as_os_str().as_bytes().to_vec()),
                     access: cap.access.to_string(),
                     is_file: cap.is_file,
                 })
@@ -3749,6 +3755,8 @@ mod linux {
                 .iter()
                 .map(|cap| UnixSocketGrantSpec {
                     path: cap.resolved.as_os_str().as_bytes().to_vec(),
+                    original_path: (cap.original.is_absolute() && cap.original != cap.resolved)
+                        .then(|| cap.original.as_os_str().as_bytes().to_vec()),
                     mode: cap.mode.to_string(),
                     is_directory: cap.is_directory(),
                 })
@@ -3765,24 +3773,10 @@ mod linux {
             caps.set_network_mode_mut(NetworkMode::Blocked);
         }
         for fs_grant in &spec.fs {
-            let access = parse_access(&fs_grant.access)?;
-            let path = OsString::from_vec(fs_grant.path.clone());
-            let cap = if fs_grant.is_file {
-                FsCapability::new_file(PathBuf::from(path), access)?
-            } else {
-                FsCapability::new_dir(PathBuf::from(path), access)?
-            };
-            caps.add_fs(cap);
+            caps.add_fs(fs_cap_from_spec(fs_grant)?);
         }
         for socket_grant in &spec.unix_sockets {
-            let mode = parse_socket_mode(&socket_grant.mode)?;
-            let path = PathBuf::from(OsString::from_vec(socket_grant.path.clone()));
-            let cap = if socket_grant.is_directory {
-                UnixSocketCapability::new_dir(path, mode)?
-            } else {
-                UnixSocketCapability::new_file(path, mode)?
-            };
-            caps.add_unix_socket(cap);
+            caps.add_unix_socket(unix_socket_cap_from_spec(socket_grant)?);
         }
         for port in &spec.tcp_connect_ports {
             caps.add_tcp_connect_port(*port);
@@ -3791,6 +3785,78 @@ mod linux {
             caps.add_tcp_bind_port(*port);
         }
         Ok(caps)
+    }
+
+    fn fs_cap_from_spec(fs_grant: &FsGrantSpec) -> Result<FsCapability> {
+        let access = parse_access(&fs_grant.access)?;
+        let path = PathBuf::from(OsString::from_vec(fs_grant.path.clone()));
+        let mut cap = if fs_grant.is_file {
+            FsCapability::new_file(&path, access)?
+        } else {
+            FsCapability::new_dir(&path, access)?
+        };
+        if let Some(original) = &fs_grant.original_path {
+            let original = PathBuf::from(OsString::from_vec(original.clone()));
+            if !original.is_absolute() {
+                return Err(NonoError::SandboxInit(format!(
+                    "ETI child filesystem grant original path {} is not absolute",
+                    original.display()
+                )));
+            }
+            let original_resolved =
+                original
+                    .canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: original.clone(),
+                        source,
+                    })?;
+            if original_resolved != cap.resolved {
+                return Err(NonoError::SandboxInit(format!(
+                    "ETI child filesystem grant original path {} resolves to {}, expected {}",
+                    original.display(),
+                    original_resolved.display(),
+                    cap.resolved.display()
+                )));
+            }
+            cap.original = original;
+        }
+        Ok(cap)
+    }
+
+    fn unix_socket_cap_from_spec(
+        socket_grant: &UnixSocketGrantSpec,
+    ) -> Result<UnixSocketCapability> {
+        let mode = parse_socket_mode(&socket_grant.mode)?;
+        let path = PathBuf::from(OsString::from_vec(socket_grant.path.clone()));
+        let mut cap = if socket_grant.is_directory {
+            UnixSocketCapability::new_dir(&path, mode)?
+        } else {
+            UnixSocketCapability::new_file(&path, mode)?
+        };
+        if let Some(original) = &socket_grant.original_path {
+            let original = PathBuf::from(OsString::from_vec(original.clone()));
+            if !original.is_absolute() {
+                return Err(NonoError::SandboxInit(format!(
+                    "ETI child unix socket grant original path {} is not absolute",
+                    original.display()
+                )));
+            }
+            let original_cap = if socket_grant.is_directory {
+                UnixSocketCapability::new_dir(&original, mode)?
+            } else {
+                UnixSocketCapability::new_file(&original, mode)?
+            };
+            if original_cap.resolved != cap.resolved {
+                return Err(NonoError::SandboxInit(format!(
+                    "ETI child unix socket grant original path {} resolves to {}, expected {}",
+                    original.display(),
+                    original_cap.resolved.display(),
+                    cap.resolved.display()
+                )));
+            }
+            cap.original = original;
+        }
+        Ok(cap)
     }
 
     fn parse_access(value: &str) -> Result<AccessMode> {
@@ -4360,12 +4426,22 @@ mod linux {
             let serialized_path = PathBuf::from(OsString::from_vec(grant.path.clone()));
             assert_eq!(serialized_path, resolved);
             assert_ne!(serialized_path, link);
+            let serialized_original = grant
+                .original_path
+                .as_ref()
+                .map(|path| PathBuf::from(OsString::from_vec(path.clone())))
+                .ok_or_else(|| {
+                    NonoError::SandboxInit(
+                        "missing filesystem original path in child spec".to_string(),
+                    )
+                })?;
+            assert_eq!(serialized_original, link);
 
             let restored = caps_from_spec(&spec)?;
             let restored_cap = restored.fs_capabilities().first().ok_or_else(|| {
                 NonoError::SandboxInit("missing restored filesystem grant".to_string())
             })?;
-            assert_eq!(restored_cap.original, resolved);
+            assert_eq!(restored_cap.original, link);
             assert_eq!(restored_cap.resolved, resolved);
 
             Ok(())
@@ -4398,13 +4474,60 @@ mod linux {
             let serialized_path = PathBuf::from(OsString::from_vec(grant.path.clone()));
             assert_eq!(serialized_path, resolved);
             assert_ne!(serialized_path, link);
+            let serialized_original = grant
+                .original_path
+                .as_ref()
+                .map(|path| PathBuf::from(OsString::from_vec(path.clone())))
+                .ok_or_else(|| {
+                    NonoError::SandboxInit(
+                        "missing unix socket original path in child spec".to_string(),
+                    )
+                })?;
+            assert_eq!(serialized_original, link);
 
             let restored = caps_from_spec(&spec)?;
             let restored_cap = restored.unix_socket_capabilities().first().ok_or_else(|| {
                 NonoError::SandboxInit("missing restored unix socket grant".to_string())
             })?;
-            assert_eq!(restored_cap.original, resolved);
+            assert_eq!(restored_cap.original, link);
             assert_eq!(restored_cap.resolved, resolved);
+
+            Ok(())
+        }
+
+        #[test]
+        fn child_cap_spec_rejects_mismatched_filesystem_original_path() -> Result<()> {
+            let temp = test_tempdir()?;
+            let real = temp.path().join("real");
+            let other = temp.path().join("other");
+            create_dir(&real)?;
+            create_dir(&other)?;
+            let resolved =
+                real.canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: real.clone(),
+                        source,
+                    })?;
+
+            let spec = ChildCapsSpec {
+                fs: vec![FsGrantSpec {
+                    path: resolved.as_os_str().as_bytes().to_vec(),
+                    original_path: Some(other.as_os_str().as_bytes().to_vec()),
+                    access: AccessMode::Read.to_string(),
+                    is_file: false,
+                }],
+                unix_sockets: Vec::new(),
+                network_blocked: false,
+                tcp_connect_ports: Vec::new(),
+                tcp_bind_ports: Vec::new(),
+            };
+
+            let err = caps_from_spec(&spec).err().ok_or_else(|| {
+                NonoError::SandboxInit(
+                    "expected mismatched filesystem original path to fail".to_string(),
+                )
+            })?;
+            assert!(err.to_string().contains("resolves to"));
 
             Ok(())
         }
@@ -4643,6 +4766,8 @@ mod macos {
     #[derive(Debug, Serialize, Deserialize)]
     struct FsGrantSpec {
         path: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_path: Option<Vec<u8>>,
         access: String,
         is_file: bool,
     }
@@ -4650,6 +4775,8 @@ mod macos {
     #[derive(Debug, Serialize, Deserialize)]
     struct UnixSocketGrantSpec {
         path: Vec<u8>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        original_path: Option<Vec<u8>>,
         mode: String,
         is_directory: bool,
     }
@@ -6622,6 +6749,8 @@ mod macos {
                 .iter()
                 .map(|cap| FsGrantSpec {
                     path: cap.resolved.as_os_str().as_bytes().to_vec(),
+                    original_path: (cap.original.is_absolute() && cap.original != cap.resolved)
+                        .then(|| cap.original.as_os_str().as_bytes().to_vec()),
                     access: cap.access.to_string(),
                     is_file: cap.is_file,
                 })
@@ -6631,6 +6760,8 @@ mod macos {
                 .iter()
                 .map(|cap| UnixSocketGrantSpec {
                     path: cap.resolved.as_os_str().as_bytes().to_vec(),
+                    original_path: (cap.original.is_absolute() && cap.original != cap.resolved)
+                        .then(|| cap.original.as_os_str().as_bytes().to_vec()),
                     mode: cap.mode.to_string(),
                     is_directory: cap.is_directory(),
                 })
@@ -6648,24 +6779,10 @@ mod macos {
             caps.set_network_mode_mut(NetworkMode::Blocked);
         }
         for fs_grant in &spec.fs {
-            let access = parse_access(&fs_grant.access)?;
-            let path = PathBuf::from(OsString::from_vec(fs_grant.path.clone()));
-            let cap = if fs_grant.is_file {
-                FsCapability::new_file(path, access)?
-            } else {
-                FsCapability::new_dir(path, access)?
-            };
-            caps.add_fs(cap);
+            caps.add_fs(fs_cap_from_spec(fs_grant)?);
         }
         for socket_grant in &spec.unix_sockets {
-            let mode = parse_socket_mode(&socket_grant.mode)?;
-            let path = PathBuf::from(OsString::from_vec(socket_grant.path.clone()));
-            let cap = if socket_grant.is_directory {
-                UnixSocketCapability::new_dir(path, mode)?
-            } else {
-                UnixSocketCapability::new_file(path, mode)?
-            };
-            caps.add_unix_socket(cap);
+            caps.add_unix_socket(unix_socket_cap_from_spec(socket_grant)?);
         }
         for rule in &spec.platform_rules {
             caps.add_platform_rule(rule.clone())?;
@@ -6677,6 +6794,78 @@ mod macos {
             caps.add_tcp_bind_port(*port);
         }
         Ok(caps)
+    }
+
+    fn fs_cap_from_spec(fs_grant: &FsGrantSpec) -> Result<FsCapability> {
+        let access = parse_access(&fs_grant.access)?;
+        let path = PathBuf::from(OsString::from_vec(fs_grant.path.clone()));
+        let mut cap = if fs_grant.is_file {
+            FsCapability::new_file(&path, access)?
+        } else {
+            FsCapability::new_dir(&path, access)?
+        };
+        if let Some(original) = &fs_grant.original_path {
+            let original = PathBuf::from(OsString::from_vec(original.clone()));
+            if !original.is_absolute() {
+                return Err(NonoError::SandboxInit(format!(
+                    "ETI child filesystem grant original path {} is not absolute",
+                    original.display()
+                )));
+            }
+            let original_resolved =
+                original
+                    .canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: original.clone(),
+                        source,
+                    })?;
+            if original_resolved != cap.resolved {
+                return Err(NonoError::SandboxInit(format!(
+                    "ETI child filesystem grant original path {} resolves to {}, expected {}",
+                    original.display(),
+                    original_resolved.display(),
+                    cap.resolved.display()
+                )));
+            }
+            cap.original = original;
+        }
+        Ok(cap)
+    }
+
+    fn unix_socket_cap_from_spec(
+        socket_grant: &UnixSocketGrantSpec,
+    ) -> Result<UnixSocketCapability> {
+        let mode = parse_socket_mode(&socket_grant.mode)?;
+        let path = PathBuf::from(OsString::from_vec(socket_grant.path.clone()));
+        let mut cap = if socket_grant.is_directory {
+            UnixSocketCapability::new_dir(&path, mode)?
+        } else {
+            UnixSocketCapability::new_file(&path, mode)?
+        };
+        if let Some(original) = &socket_grant.original_path {
+            let original = PathBuf::from(OsString::from_vec(original.clone()));
+            if !original.is_absolute() {
+                return Err(NonoError::SandboxInit(format!(
+                    "ETI child unix socket grant original path {} is not absolute",
+                    original.display()
+                )));
+            }
+            let original_cap = if socket_grant.is_directory {
+                UnixSocketCapability::new_dir(&original, mode)?
+            } else {
+                UnixSocketCapability::new_file(&original, mode)?
+            };
+            if original_cap.resolved != cap.resolved {
+                return Err(NonoError::SandboxInit(format!(
+                    "ETI child unix socket grant original path {} resolves to {}, expected {}",
+                    original.display(),
+                    original_cap.resolved.display(),
+                    cap.resolved.display()
+                )));
+            }
+            cap.original = original;
+        }
+        Ok(cap)
     }
 
     fn parse_access(value: &str) -> Result<AccessMode> {
@@ -8146,12 +8335,22 @@ mod macos {
             let serialized_path = PathBuf::from(OsString::from_vec(grant.path.clone()));
             assert_eq!(serialized_path, resolved);
             assert_ne!(serialized_path, link);
+            let serialized_original = grant
+                .original_path
+                .as_ref()
+                .map(|path| PathBuf::from(OsString::from_vec(path.clone())))
+                .ok_or_else(|| {
+                    NonoError::SandboxInit(
+                        "missing filesystem original path in child spec".to_string(),
+                    )
+                })?;
+            assert_eq!(serialized_original, link);
 
             let restored = caps_from_spec(&spec)?;
             let restored_cap = restored.fs_capabilities().first().ok_or_else(|| {
                 NonoError::SandboxInit("missing restored filesystem grant".to_string())
             })?;
-            assert_eq!(restored_cap.original, resolved);
+            assert_eq!(restored_cap.original, link);
             assert_eq!(restored_cap.resolved, resolved);
 
             Ok(())
@@ -8184,13 +8383,61 @@ mod macos {
             let serialized_path = PathBuf::from(OsString::from_vec(grant.path.clone()));
             assert_eq!(serialized_path, resolved);
             assert_ne!(serialized_path, link);
+            let serialized_original = grant
+                .original_path
+                .as_ref()
+                .map(|path| PathBuf::from(OsString::from_vec(path.clone())))
+                .ok_or_else(|| {
+                    NonoError::SandboxInit(
+                        "missing unix socket original path in child spec".to_string(),
+                    )
+                })?;
+            assert_eq!(serialized_original, link);
 
             let restored = caps_from_spec(&spec)?;
             let restored_cap = restored.unix_socket_capabilities().first().ok_or_else(|| {
                 NonoError::SandboxInit("missing restored unix socket grant".to_string())
             })?;
-            assert_eq!(restored_cap.original, resolved);
+            assert_eq!(restored_cap.original, link);
             assert_eq!(restored_cap.resolved, resolved);
+
+            Ok(())
+        }
+
+        #[test]
+        fn child_cap_spec_rejects_mismatched_filesystem_original_path() -> Result<()> {
+            let temp = test_tempdir()?;
+            let real = temp.path().join("real");
+            let other = temp.path().join("other");
+            create_dir(&real)?;
+            create_dir(&other)?;
+            let resolved =
+                real.canonicalize()
+                    .map_err(|source| NonoError::PathCanonicalization {
+                        path: real.clone(),
+                        source,
+                    })?;
+
+            let spec = ChildCapsSpec {
+                fs: vec![FsGrantSpec {
+                    path: resolved.as_os_str().as_bytes().to_vec(),
+                    original_path: Some(other.as_os_str().as_bytes().to_vec()),
+                    access: AccessMode::Read.to_string(),
+                    is_file: false,
+                }],
+                unix_sockets: Vec::new(),
+                platform_rules: Vec::new(),
+                network_blocked: false,
+                tcp_connect_ports: Vec::new(),
+                tcp_bind_ports: Vec::new(),
+            };
+
+            let err = caps_from_spec(&spec).err().ok_or_else(|| {
+                NonoError::SandboxInit(
+                    "expected mismatched filesystem original path to fail".to_string(),
+                )
+            })?;
+            assert!(err.to_string().contains("resolves to"));
 
             Ok(())
         }
