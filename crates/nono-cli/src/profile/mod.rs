@@ -10,6 +10,7 @@ use nono::{NonoError, Result};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 // Re-export InjectMode and OAuth2Config from nono-proxy for use in profiles
@@ -2251,6 +2252,23 @@ enum ResolvedBase {
     Global(Profile),
 }
 
+/// Emit a deprecation warning when an `extends` short name resolves to a pack
+/// profile via `install_as`. Integrates with `WarningCounterGuard` so
+/// `nono profile validate --strict` can fail on this pattern, and with
+/// `WarningSuppressionGuard` for preview-parse paths that re-parse later.
+fn emit_extends_install_as_warning(name: &str, pack_key: &str) {
+    if crate::deprecation_warnings::is_suppressed() {
+        return;
+    }
+    crate::deprecation_warnings::note_deprecation();
+    let _ = writeln!(
+        std::io::stderr(),
+        "warning: 'extends: \"{name}\"' resolved to pack '{pack_key}' via install_as \
+         — use 'extends: \"{pack_key}\"' instead \
+         (short-name pack resolution in extends will be removed in v1.0.0, #969)"
+    );
+}
+
 /// Load a base profile by name WITHOUT applying implicit default-group merging.
 ///
 /// Checks sibling profiles in `context_dir` first (so project-local profiles
@@ -2275,6 +2293,25 @@ fn load_base_profile_raw(
     context_dir: Option<&Path>,
     source_file: Option<&Path>,
 ) -> Result<ResolvedBase> {
+    // 0a. Registry ref (org/name) — explicit canonical form; no short-name
+    //     ambiguity. Try local pack store first; auto-pull only if we were
+    //     entered through `load_profile` (the migration-prompt path).
+    if is_registry_ref(name) {
+        let package_ref = crate::package::parse_package_ref(name).map_err(|e| {
+            NonoError::ProfileInheritance(format!("invalid pack ref '{name}': {e}"))
+        })?;
+        let install_dir = crate::package::package_install_dir(
+            &package_ref.namespace,
+            &package_ref.name,
+        )?;
+        if install_dir.join("package.json").exists() || missing_base_prompt_enabled() {
+            return load_registry_profile(name).map(ResolvedBase::Global);
+        }
+        return Err(NonoError::ProfileInheritance(format!(
+            "pack '{name}' is not installed; run: nono pull {name}"
+        )));
+    }
+
     if !is_valid_profile_name(name) {
         return Err(NonoError::ProfileInheritance(format!(
             "invalid base profile name '{}'",
@@ -2282,9 +2319,9 @@ fn load_base_profile_raw(
         )));
     }
 
-    // 0. Sibling in the same directory as the child profile.
-    //    Skip if the sibling path is the source file itself to avoid
-    //    self-references (e.g. `.nono/codex.json` extending "codex").
+    // 0b. Sibling in the same directory as the child profile.
+    //     Skip if the sibling path is the source file itself to avoid
+    //     self-references (e.g. `.nono/codex.json` extending "codex").
     if let Some(dir) = context_dir {
         let sibling_path = dir.join(format!("{name}.json"));
         let is_self = source_file.is_some_and(|src| sibling_path == src);
@@ -2312,6 +2349,9 @@ fn load_base_profile_raw(
     // the merge chain and reaches verification even if the profile JSON
     // doesn't declare its own pack.
     if let Some((profile_path, pack_key)) = find_pack_store_profile(name) {
+        // Short-name resolution via install_as in `extends` is deprecated.
+        // Emit a warning so users can migrate to the unambiguous org/name form.
+        emit_extends_install_as_warning(name, &pack_key);
         let mut base = parse_profile_file(&profile_path)?;
         if !base.packs.contains(&pack_key) {
             base.packs.push(pack_key);
@@ -2340,6 +2380,7 @@ fn load_base_profile_raw(
         match outcome {
             crate::migration::MigrationOutcome::Migrated => {
                 if let Some((profile_path, pack_key)) = find_pack_store_profile(name) {
+                    emit_extends_install_as_warning(name, &pack_key);
                     let mut base = parse_profile_file(&profile_path)?;
                     if !base.packs.contains(&pack_key) {
                         base.packs.push(pack_key);
@@ -6316,5 +6357,49 @@ mod tests {
             err.to_string().contains("unknown field"),
             "unexpected error: {err}"
         );
+    }
+
+    // --- Tests for issue #969: extends short-name deprecation warning ---
+
+    #[test]
+    fn extends_registry_ref_not_installed_no_migrate_returns_error() {
+        // When `extends: "org/name"` is used but the pack is not installed and
+        // we are NOT in the migration-prompt context, the call must fail with a
+        // clear "not installed" message rather than an obscure validity error.
+        let result = load_base_profile_raw("always-further/nonexistent-pack-xyz", None, None);
+        assert!(result.is_err(), "should fail when pack not installed");
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("not installed") || msg.contains("nono pull"),
+            "error should mention 'not installed' or 'nono pull', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn emit_extends_install_as_warning_increments_counter() {
+        // emit_extends_install_as_warning must bump the WarningCounterGuard when
+        // called outside a suppression scope.
+        let guard = crate::deprecation_warnings::WarningCounterGuard::begin();
+        emit_extends_install_as_warning("claude-code", "always-further/claude");
+        let count = guard.finish();
+        assert_eq!(count, 1, "counter must increment outside suppression scope");
+    }
+
+    #[test]
+    fn emit_extends_install_as_warning_suppressed_by_guard() {
+        // Inside a WarningSuppressionGuard the counter must stay at zero.
+        let counter_guard = crate::deprecation_warnings::WarningCounterGuard::begin();
+        let _suppress = crate::deprecation_warnings::WarningSuppressionGuard::begin();
+        emit_extends_install_as_warning("claude-code", "always-further/claude");
+        drop(_suppress);
+        let count = counter_guard.finish();
+        assert_eq!(count, 0, "counter must stay zero inside suppression scope");
+    }
+
+    #[test]
+    fn emit_extends_install_as_warning_no_op_outside_counter_scope() {
+        // Calling outside any counter scope must not panic or corrupt state.
+        // This mirrors how `note_deprecation` behaves outside a counter scope.
+        emit_extends_install_as_warning("claude-code", "always-further/claude");
     }
 }
