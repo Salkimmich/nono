@@ -150,6 +150,34 @@ jobs:
           BODY=$(sed 's/^          //' "$BODY_FILE")
           rm -f "$BODY_FILE"
 
+          # ── Apply labels ──────────────────────────────────────────────────────
+          # Crate labels (already exist in the repo)
+          LABELS_TO_ADD=()
+          [ "$TOUCHES_NONO_LIB" = "true" ] && LABELS_TO_ADD+=("nono")
+          [ "$TOUCHES_PROXY"    = "true" ] && LABELS_TO_ADD+=("nono-proxy")
+          [ "$TOUCHES_CLI"      = "true" ] && LABELS_TO_ADD+=("nono-cli")
+
+          # Size labels — remove any stale size label first, then add the current one
+          SIZE_LABELS="size/small size/medium size/large"
+          for sl in $SIZE_LABELS; do
+            gh pr edit "$PR_NUMBER" --repo "$GH_REPO" --remove-label "$sl" 2>/dev/null || true
+          done
+
+          if   [ "$TOTAL_LOC" -lt 50  ]; then LABELS_TO_ADD+=("size/small")
+          elif [ "$TOTAL_LOC" -lt 300 ]; then LABELS_TO_ADD+=("size/medium")
+          else                                LABELS_TO_ADD+=("size/large")
+          fi
+
+          if [ ${#LABELS_TO_ADD[@]} -gt 0 ]; then
+            ADD_ARGS=""
+            for lbl in "${LABELS_TO_ADD[@]}"; do
+              ADD_ARGS="$ADD_ARGS --add-label $lbl"
+            done
+            # shellcheck disable=SC2086
+            gh pr edit "$PR_NUMBER" --repo "$GH_REPO" $ADD_ARGS
+            echo "Applied labels: ${LABELS_TO_ADD[*]}"
+          fi
+
           # ── Post or update comment ────────────────────────────────────────────
           EXISTING_ID=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER/comments" \
             --paginate \
