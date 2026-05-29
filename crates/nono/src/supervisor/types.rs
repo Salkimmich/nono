@@ -8,6 +8,13 @@ use crate::capability::AccessMode;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
+use zeroize::Zeroizing;
+
+/// Secret bytes carried over supervisor IPC.
+///
+/// The wrapper zeroizes the allocation when dropped. It does not protect
+/// serialized copies in kernel/socket buffers or provider-owned allocations.
+pub type SecretBytes = Zeroizing<Vec<u8>>;
 
 /// A request from the sandboxed child for additional filesystem access.
 ///
@@ -83,7 +90,7 @@ pub struct AuditEntry {
 /// sandbox, where the browser can access its own config files freely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UrlOpenRequest {
-    /// Unique identifier for this request (for replay protection and audit)
+    /// Unique identifier for correlating the request with its response and audit entries.
     pub request_id: String,
     /// The URL to open in the user's browser
     pub url: String,
@@ -140,7 +147,7 @@ pub enum CredentialOperation {
 /// must not log it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialRequest {
-    /// Unique identifier for this request (for replay protection and audit)
+    /// Unique identifier for correlating the request with its response and audit entries.
     pub request_id: String,
     /// Frontend that converted the native operation into this request.
     pub frontend: CredentialFrontend,
@@ -165,7 +172,7 @@ pub struct CredentialRequest {
     /// Keychain access group, when present.
     pub access_group: Option<String>,
     /// Secret bytes for create/update/upsert operations.
-    pub secret: Option<Vec<u8>>,
+    pub secret: Option<SecretBytes>,
     /// Whether the caller requested secret material in the response.
     pub return_secret: bool,
     /// PID of the requesting child process.
@@ -181,7 +188,7 @@ pub enum CredentialResponse {
     /// operations that requested secret material.
     Ok {
         request_id: String,
-        secret: Option<Vec<u8>>,
+        secret: Option<SecretBytes>,
     },
     /// Operation was denied by policy.
     Denied { request_id: String, reason: String },

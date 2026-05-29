@@ -1,9 +1,9 @@
 use nono::supervisor::{
     CredentialFrontend, CredentialItemClass, CredentialOperation, CredentialProvider,
-    CredentialRequest, CredentialResponse, SupervisorMessage, SupervisorResponse,
+    CredentialRequest, CredentialResponse, SecretBytes, SupervisorMessage, SupervisorResponse,
 };
 use nono::{NonoError, Result};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 pub(crate) const CREDENTIAL_BROKER_ENV: &str = "NONO_CREDENTIAL_BROKER";
@@ -16,7 +16,7 @@ pub(crate) struct CredentialSecurityCommand {
     pub(crate) service: Option<String>,
     pub(crate) account: Option<String>,
     pub(crate) label: Option<String>,
-    pub(crate) secret: Option<Vec<u8>>,
+    pub(crate) secret: Option<SecretBytes>,
     pub(crate) return_secret: bool,
 }
 
@@ -106,10 +106,13 @@ pub(crate) fn run_credential_helper(args: &[String]) -> Result<()> {
     match socket.recv_response()? {
         SupervisorResponse::Credential(CredentialResponse::Ok { secret, .. }) => {
             if let Some(secret) = secret {
-                let stdout = String::from_utf8(secret).map_err(|e| {
-                    NonoError::SandboxInit(format!("credential response was not UTF-8: {e}"))
+                let mut stdout = std::io::stdout().lock();
+                stdout.write_all(&secret).map_err(|e| {
+                    NonoError::SandboxInit(format!("failed to write credential response: {e}"))
                 })?;
-                println!("{stdout}");
+                stdout.write_all(b"\n").map_err(|e| {
+                    NonoError::SandboxInit(format!("failed to write credential response: {e}"))
+                })?;
             }
             Ok(())
         }
@@ -219,7 +222,7 @@ enum CredentialBrokerError {
 
 fn handle_credential_request_inner(
     request: CredentialRequest,
-) -> std::result::Result<Option<Vec<u8>>, CredentialBrokerError> {
+) -> std::result::Result<Option<SecretBytes>, CredentialBrokerError> {
     if request.provider != CredentialProvider::MacosKeychain {
         return Err(CredentialBrokerError::Unsupported(
             "unsupported credential provider".to_string(),
@@ -258,13 +261,13 @@ fn keyring_entry(
 #[cfg(feature = "system-keyring")]
 fn read_generic_password(
     request: &CredentialRequest,
-) -> std::result::Result<Option<Vec<u8>>, CredentialBrokerError> {
+) -> std::result::Result<Option<SecretBytes>, CredentialBrokerError> {
     let entry = keyring_entry(request)?;
     let password = entry
         .get_password()
         .map_err(|e| CredentialBrokerError::Error(format!("failed to read keychain entry: {e}")))?;
     if request.return_secret {
-        Ok(Some(password.into_bytes()))
+        Ok(Some(SecretBytes::new(password.into_bytes())))
     } else {
         Ok(None)
     }
@@ -273,7 +276,7 @@ fn read_generic_password(
 #[cfg(feature = "system-keyring")]
 fn write_generic_password(
     request: &CredentialRequest,
-) -> std::result::Result<Option<Vec<u8>>, CredentialBrokerError> {
+) -> std::result::Result<Option<SecretBytes>, CredentialBrokerError> {
     let entry = keyring_entry(request)?;
     let secret = request.secret.as_deref().ok_or_else(|| {
         CredentialBrokerError::Denied("credential secret is required".to_string())
@@ -290,7 +293,7 @@ fn write_generic_password(
 #[cfg(feature = "system-keyring")]
 fn delete_generic_password(
     request: &CredentialRequest,
-) -> std::result::Result<Option<Vec<u8>>, CredentialBrokerError> {
+) -> std::result::Result<Option<SecretBytes>, CredentialBrokerError> {
     let entry = keyring_entry(request)?;
     entry.delete_credential().map_err(|e| {
         CredentialBrokerError::Error(format!("failed to delete keychain entry: {e}"))
@@ -301,7 +304,7 @@ fn delete_generic_password(
 #[cfg(not(feature = "system-keyring"))]
 fn read_generic_password(
     _request: &CredentialRequest,
-) -> std::result::Result<Option<Vec<u8>>, CredentialBrokerError> {
+) -> std::result::Result<Option<SecretBytes>, CredentialBrokerError> {
     Err(CredentialBrokerError::Unsupported(
         "system keyring support is disabled".to_string(),
     ))
@@ -310,7 +313,7 @@ fn read_generic_password(
 #[cfg(not(feature = "system-keyring"))]
 fn write_generic_password(
     _request: &CredentialRequest,
-) -> std::result::Result<Option<Vec<u8>>, CredentialBrokerError> {
+) -> std::result::Result<Option<SecretBytes>, CredentialBrokerError> {
     Err(CredentialBrokerError::Unsupported(
         "system keyring support is disabled".to_string(),
     ))
@@ -319,7 +322,7 @@ fn write_generic_password(
 #[cfg(not(feature = "system-keyring"))]
 fn delete_generic_password(
     _request: &CredentialRequest,
-) -> std::result::Result<Option<Vec<u8>>, CredentialBrokerError> {
+) -> std::result::Result<Option<SecretBytes>, CredentialBrokerError> {
     Err(CredentialBrokerError::Unsupported(
         "system keyring support is disabled".to_string(),
     ))
@@ -391,7 +394,7 @@ struct SecurityFlags {
     account: Option<String>,
     service: Option<String>,
     label: Option<String>,
-    secret: Option<Vec<u8>>,
+    secret: Option<SecretBytes>,
     print_password: bool,
     update_existing: bool,
 }
@@ -416,7 +419,7 @@ fn parse_security_flags(args: &[String]) -> std::result::Result<SecurityFlags, S
             "-w" => {
                 if matches!(args.get(i + 1), Some(value) if !value.starts_with('-')) {
                     i += 1;
-                    flags.secret = Some(args[i].as_bytes().to_vec());
+                    flags.secret = Some(SecretBytes::new(args[i].as_bytes().to_vec()));
                 } else {
                     flags.print_password = true;
                 }
@@ -457,7 +460,7 @@ fn require_flag(value: &Option<String>, flag: &str) -> std::result::Result<Strin
         .ok_or_else(|| format!("{flag} is required for this security command"))
 }
 
-fn decode_hex(input: &str) -> std::result::Result<Vec<u8>, String> {
+fn decode_hex(input: &str) -> std::result::Result<SecretBytes, String> {
     if !input.len().is_multiple_of(2) {
         return Err("-X hex value must have an even number of digits".to_string());
     }
@@ -467,7 +470,7 @@ fn decode_hex(input: &str) -> std::result::Result<Vec<u8>, String> {
         let low = hex_nibble(pair[1])?;
         out.push((high << 4) | low);
     }
-    Ok(out)
+    Ok(SecretBytes::new(out))
 }
 
 fn hex_nibble(byte: u8) -> std::result::Result<u8, String> {
@@ -565,7 +568,10 @@ mod tests {
         assert_eq!(command.operation, CredentialOperation::Upsert);
         assert_eq!(command.account.as_deref(), Some("alice"));
         assert_eq!(command.service.as_deref(), Some("example-service"));
-        assert_eq!(command.secret.as_deref(), Some("token".as_bytes()));
+        assert_eq!(
+            command.secret.as_ref().map(|secret| secret.as_slice()),
+            Some("token".as_bytes())
+        );
     }
 
     #[test]
