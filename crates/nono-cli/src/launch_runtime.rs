@@ -133,6 +133,14 @@ pub(crate) struct ProxyLaunchOptions {
     pub(crate) network_block: bool,
     pub(crate) proxy_leaf_validity: Option<std::time::Duration>,
     pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
+    /// Environment variables the proxy must source (e.g. credential-bearing
+    /// values) for tool-sandbox brokered commands.
+    pub(crate) proxy_source_env_vars: HashMap<String, String>,
+    /// Per-credential base-URL environment variables injected into tool-sandbox
+    /// brokered commands so they target the proxy reverse-route.
+    pub(crate) tool_sandbox_base_url_env_vars: HashMap<String, String>,
+    /// Credential names that are brokered to tool-sandbox commands via the proxy.
+    pub(crate) tool_sandbox_proxy_credentials: HashSet<String>,
 }
 
 impl ProxyLaunchOptions {
