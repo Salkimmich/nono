@@ -69,12 +69,6 @@ struct UpdateCheckRequest {
     ci_provider: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CiEnvironment {
-    is_ci: bool,
-    provider: Option<&'static str>,
-}
-
 const CI_PROVIDER_ENV_VARS: &[(&str, &str)] = &[
     ("GITHUB_ACTIONS", "github_actions"),
     ("GITLAB_CI", "gitlab_ci"),
@@ -288,27 +282,18 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
     }
 }
 
-fn detect_ci_environment() -> CiEnvironment {
+fn detect_ci_provider() -> Option<&'static str> {
     for (env_var, provider) in CI_PROVIDER_ENV_VARS {
         if env_marker_present(env_var) {
-            return CiEnvironment {
-                is_ci: true,
-                provider: Some(provider),
-            };
+            return Some(provider);
         }
     }
 
     if env_marker_present("CI") {
-        return CiEnvironment {
-            is_ci: true,
-            provider: Some("generic"),
-        };
+        return Some("generic");
     }
 
-    CiEnvironment {
-        is_ci: false,
-        provider: None,
-    }
+    None
 }
 
 fn env_marker_present(key: &str) -> bool {
@@ -321,14 +306,14 @@ fn env_marker_present(key: &str) -> bool {
 
 /// Perform the HTTP check against the update service
 fn perform_check(uuid: &str) -> Option<UpdateInfo> {
-    let ci_environment = detect_ci_environment();
+    let ci_provider = detect_ci_provider();
     let request = UpdateCheckRequest {
         uuid: uuid.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         platform: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        ci: ci_environment.is_ci,
-        ci_provider: ci_environment.provider,
+        ci: ci_provider.is_some(),
+        ci_provider,
     };
 
     let body = serde_json::to_string(&request).ok()?;
@@ -475,13 +460,7 @@ mod tests {
             ("CI", ""),
         ]);
 
-        assert_eq!(
-            detect_ci_environment(),
-            CiEnvironment {
-                is_ci: true,
-                provider: Some("github_actions"),
-            }
-        );
+        assert_eq!(detect_ci_provider(), Some("github_actions"));
     }
 
     #[test]
@@ -512,13 +491,69 @@ mod tests {
             ("CI", "true"),
         ]);
 
-        assert_eq!(
-            detect_ci_environment(),
-            CiEnvironment {
-                is_ci: true,
-                provider: Some("generic"),
-            }
-        );
+        assert_eq!(detect_ci_provider(), Some("generic"));
+    }
+
+    #[test]
+    fn test_detect_ci_environment_falsey_markers_are_ignored() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("GITHUB_ACTIONS", "false"),
+            ("GITLAB_CI", "0"),
+            ("CIRCLECI", ""),
+            ("BUILDKITE", ""),
+            ("TF_BUILD", ""),
+            ("TRAVIS", ""),
+            ("JENKINS_URL", ""),
+            ("JENKINS_HOME", ""),
+            ("BITBUCKET_BUILD_NUMBER", ""),
+            ("APPVEYOR", ""),
+            ("TEAMCITY_VERSION", ""),
+            ("DRONE", ""),
+            ("SEMAPHORE", ""),
+            ("CODESHIP", ""),
+            ("WOODPECKER", ""),
+            ("NETLIFY", ""),
+            ("VERCEL", ""),
+            ("RENDER", ""),
+            ("CI", "0"),
+        ]);
+
+        assert_eq!(detect_ci_provider(), None);
+    }
+
+    #[test]
+    fn test_detect_ci_environment_no_ci() {
+        let _lock = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("GITHUB_ACTIONS", ""),
+            ("GITLAB_CI", ""),
+            ("CIRCLECI", ""),
+            ("BUILDKITE", ""),
+            ("TF_BUILD", ""),
+            ("TRAVIS", ""),
+            ("JENKINS_URL", ""),
+            ("JENKINS_HOME", ""),
+            ("BITBUCKET_BUILD_NUMBER", ""),
+            ("APPVEYOR", ""),
+            ("TEAMCITY_VERSION", ""),
+            ("DRONE", ""),
+            ("SEMAPHORE", ""),
+            ("CODESHIP", ""),
+            ("WOODPECKER", ""),
+            ("NETLIFY", ""),
+            ("VERCEL", ""),
+            ("RENDER", ""),
+            ("CI", ""),
+        ]);
+
+        assert_eq!(detect_ci_provider(), None);
     }
 
     #[test]
