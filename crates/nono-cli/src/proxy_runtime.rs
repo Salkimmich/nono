@@ -998,5 +998,4 @@ mod tests {
             "--allow-endpoint for a service without --credential must error"
         );
     }
-
 }
