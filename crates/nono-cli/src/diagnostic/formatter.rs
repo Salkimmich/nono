@@ -78,7 +78,7 @@ pub struct ErrorObservation {
     pub missing_paths: Vec<PathBuf>,
     /// Error text that strongly suggests a non-sandbox application failure.
     pub non_sandbox_failure: Option<String>,
-    /// Stderr suggests network access may have been blocked.
+    /// Stderr contains a pattern that might indicate network access was blocked.
     pub network_blocked_hint: bool,
 }
 
@@ -612,7 +612,7 @@ pub struct DiagnosticFormatter<'a> {
     missing_path_hints: Vec<PathBuf>,
     /// Error text that strongly suggests a non-sandbox application failure.
     non_sandbox_failure: Option<String>,
-    /// Stderr suggests network access may have been blocked.
+    /// Stderr contains a pattern that might indicate network access was blocked.
     network_blocked_hint: bool,
     /// Command that was executed (for context-aware diagnostics)
     command: Option<CommandContext>,

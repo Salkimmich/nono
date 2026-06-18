@@ -137,9 +137,8 @@ pub fn diagnostic_network_blocked() -> NonoDiagnostic {
     NonoDiagnostic::new(
         NonoDiagnosticCode::SandboxDeniedNetwork,
         NonoDiagnosticSeverity::Warning,
-        "command output suggests network access may be blocked",
+        "command output contains a network error; if a required host is unreachable, check whether network access is blocked",
     )
-    .with_remediation(NonoRemediation::GrantNetwork)
     .with_detail(NonoDiagnosticDetail::StderrObservation {
         observation_kind: StderrObservationKind::NetworkBlocked,
     })
