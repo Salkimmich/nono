@@ -1463,7 +1463,7 @@ pub fn verify_audit_log(
 mod tests {
     use super::*;
     use crate::AccessMode;
-    use crate::supervisor::{ApprovalDecision, CapabilityRequest};
+    use crate::supervisor::{ApprovalDecision, ApprovalRequest};
     use crate::undo::{ExecutableIdentity, NetworkAuditDecision, NetworkAuditMode};
     use std::io::BufReader;
     use std::time::{Duration, UNIX_EPOCH};
@@ -1523,7 +1523,7 @@ mod tests {
         recorder
             .record_capability_decision(AuditEntry {
                 timestamp: UNIX_EPOCH + Duration::from_secs(5),
-                request: CapabilityRequest {
+                request: ApprovalRequest::Capability {
                     request_id: "req-1".to_string(),
                     path: PathBuf::from("/tmp/example"),
                     access: AccessMode::ReadWrite,
@@ -1561,7 +1561,24 @@ mod tests {
                 managed_credential_active: None,
                 injection_mode: None,
                 denial_category: None,
+                endpoint_policy_action: None,
+                endpoint_policy_rule: None,
+                approval_backend: None,
+                credential_capture_action: None,
+                credential_capture_name: None,
+                credential_capture_command: None,
+                credential_capture_argv: None,
+                credential_capture_exit_status: None,
+                credential_capture_duration_ms: None,
+                credential_capture_stdout_bytes: None,
+                credential_capture_stderr: None,
+                credential_capture_cache_scope: None,
+                credential_capture_output_format: None,
+                credential_capture_header_names: None,
+                credential_capture_stdin_mode: None,
+                credential_capture_interactive: None,
                 target: "api.example.com".to_string(),
+                upstream: None,
                 port: Some(443),
                 method: Some("POST".to_string()),
                 path: Some("/v1/chat".to_string()),
@@ -1735,7 +1752,24 @@ mod tests {
                 managed_credential_active: None,
                 injection_mode: None,
                 denial_category: None,
+                endpoint_policy_action: None,
+                endpoint_policy_rule: None,
+                approval_backend: None,
+                credential_capture_action: None,
+                credential_capture_name: None,
+                credential_capture_command: None,
+                credential_capture_argv: None,
+                credential_capture_exit_status: None,
+                credential_capture_duration_ms: None,
+                credential_capture_stdout_bytes: None,
+                credential_capture_stderr: None,
+                credential_capture_cache_scope: None,
+                credential_capture_output_format: None,
+                credential_capture_header_names: None,
+                credential_capture_stdin_mode: None,
+                credential_capture_interactive: None,
                 target: "example.com".to_string(),
+                upstream: None,
                 port: Some(443),
                 method: Some("GET".to_string()),
                 path: Some("/".to_string()),

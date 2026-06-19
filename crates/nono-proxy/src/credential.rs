@@ -849,6 +849,7 @@ mod tests {
             proxy: None,
             env_var: Some("MY_API_KEY".to_string()),
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -878,6 +879,7 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
@@ -1034,8 +1036,11 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
-        let store = CredentialStore::load(&routes, &tls).expect("credential store loads");
+        let store = CredentialStore::load_with_diagnostics(&routes, &tls)
+            .expect("credential store loads")
+            .store;
         assert!(store.get("github").is_none());
         let cmd = store.get_cmd("github").expect("cmd route registered");
         assert_eq!(cmd.credential_name, "github");

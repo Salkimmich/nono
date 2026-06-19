@@ -1158,6 +1158,7 @@ mod tests {
                 loaded_routes: std::collections::HashSet::new(),
                 no_proxy_hosts: Vec::new(),
                 intercept_ca_path: None,
+                diagnostics: vec![],
             };
         }
 
@@ -2031,6 +2032,7 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,

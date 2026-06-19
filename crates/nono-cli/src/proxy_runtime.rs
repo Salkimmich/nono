@@ -1613,6 +1613,7 @@ fn collect_tool_sandbox_proxy_grants(
                     crate::policy::expand_path(path).map(|path| path.to_string_lossy().into_owned())
                 })
                 .transpose()?,
+            aws_auth: None,
         };
 
         if let Some(existing) = custom_credentials.get(&grant.name) {
@@ -2544,6 +2545,7 @@ mod tests {
                 proxy: None,
                 env_var: Some("MOCK_API_KEY".to_string()),
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
@@ -2554,6 +2556,10 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
+            profile_display_name: None,
+            command_policies: None,
+            credential_capture: HashMap::new(),
+            tls_intercept: None,
             session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
@@ -2583,7 +2589,7 @@ mod tests {
         };
 
         let args = crate::cli::SandboxArgs::default();
-        let opts = prepare_proxy_launch_options(&args, &prepared, true)
+        let opts = prepare_proxy_launch_options(&args, &prepared, true, String::new())
             .expect("prepare_proxy_launch_options");
 
         assert!(
@@ -2867,6 +2873,7 @@ mod tests {
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         });
         let credential_env_vars = vec![
             (
