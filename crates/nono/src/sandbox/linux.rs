@@ -1756,7 +1756,10 @@ pub fn seccomp_network_fallback_mode(caps: &CapabilitySet) -> SeccompNetFallback
 /// `socket()` is allowed only for `AF_UNIX`, `AF_INET`, `AF_INET6`.
 /// `socketpair()` is allowed only for `AF_UNIX`.
 /// `io_uring_setup()` is denied.
-fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
+fn build_seccomp_proxy_filter(
+    _has_bind_ports: bool,
+    ipc_fd: std::os::unix::io::RawFd,
+) -> Vec<SockFilterInsn> {
     let errno_ret = SECCOMP_RET_ERRNO | (libc::EACCES as u32);
 
     // bind() always routes to USER_NOTIF so the supervisor can make the
@@ -1770,7 +1773,10 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     // supervisor's `decide_network_notification` is the sole arbiter.
     let bind_action = SECCOMP_RET_USER_NOTIF;
 
-    // sendto(), sendmsg(), and sendmmsg() route unconditionally to USER_NOTIF.
+    // sendto() and sendmmsg() route unconditionally to USER_NOTIF.
+    // sendmsg() routes to a check-fd block: if the sockfd is the IPC socket
+    // pair used to hand the notify fd to the parent supervisor, allow it
+    // (SCM_RIGHTS handshake); otherwise route to USER_NOTIF as normal.
     // The supervisor does the full-width NULL destination checks and inspects
     // each sendmmsg vector entry.
     //
@@ -1781,7 +1787,7 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     //  3: jeq BIND       jt=16 -> insn 20
     //  4: jeq SOCKETPAIR jt=11 -> insn 16
     //  5: jeq SENDTO     jt=15 -> insn 21
-    //  6: jeq SENDMSG    jt=14 -> insn 21
+    //  6: jeq SENDMSG    jt=16 -> insn 23  (check_fd)
     //  7: jeq SENDMMSG   jt=13 -> insn 21
     //  8: jeq IO_URING   jt=1  -> insn 10
     //  9: ret ALLOW
@@ -1796,8 +1802,12 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
     // 18: ret ERRNO            (bad socketpair family)
     // 19: ret USER_NOTIF       (connect)
     // 20: ret bind_action      (bind)
-    // 21: ret USER_NOTIF       (sendto/sendmsg/sendmmsg)
+    // 21: ret USER_NOTIF       (sendto/sendmmsg)
     // 22: ret ALLOW            (good socket/socketpair)
+    // 23: ld [args[0]]         check_fd: load sendmsg sockfd
+    // 24: jeq ipc_fd jt=+1 (-> 26: allow) jf=0 (-> 25: notif)
+    // 25: ret USER_NOTIF
+    // 26: ret ALLOW            ipc handshake sendmsg
 
     vec![
         // 0: ld [nr]
@@ -1842,10 +1852,10 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
             jf: 0,
             k: SYS_SENDTO as u32,
         },
-        // 6: jeq SYS_SENDMSG -> 21 (jt = 21-6-1 = 14)
+        // 6: jeq SYS_SENDMSG -> 23 (jt = 23-6-1 = 16) — check_fd block
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 14,
+            jt: 16,
             jf: 0,
             k: SYS_SENDMSG as u32,
         },
@@ -1961,6 +1971,34 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         },
+        // 23: ld [args[0]] — check_fd: load sendmsg sockfd
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG0_OFFSET,
+        },
+        // 24: jeq ipc_fd jt=+1 (-> 26: allow) jf=0 (-> 25: notif)
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: ipc_fd as u32,
+        },
+        // 25: ret USER_NOTIF
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_USER_NOTIF,
+        },
+        // 26: ret ALLOW — ipc handshake sendmsg
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
     ]
 }
 
@@ -1978,15 +2016,18 @@ fn build_seccomp_proxy_filter(_has_bind_ports: bool) -> Vec<SockFilterInsn> {
 /// Instruction layout:
 /// ```text
 ///  0: ld  [nr]
-///  1: jeq SYS_CONNECT  jt=+5 (-> 7: notify)
-///  2: jeq SYS_BIND     jt=+4 (-> 7: notify)
-///  3: jeq SYS_SENDTO   jt=+3 (-> 7: notify)
-///  4: jeq SYS_SENDMSG  jt=+2 (-> 7: notify)
-///  5: jeq SYS_SENDMMSG jt=+1 (-> 7: notify)
+///  1: jeq SYS_CONNECT  jt=+7 (->  9: notify)
+///  2: jeq SYS_BIND     jt=+6 (->  9: notify)
+///  3: jeq SYS_SENDTO   jt=+5 (->  9: notify)
+///  4: jeq SYS_SENDMSG  jt=+2 (->  7: check_fd)
+///  5: jeq SYS_SENDMMSG jt=+3 (->  9: notify)
 ///  6: ret ALLOW
-///  7: ret USER_NOTIF
+///  7: ld  [args[0]]            check_fd: load sendmsg sockfd arg
+///  8: jeq ipc_fd  jt=+1 (-> 10: allow)  jf=0 (-> 9: notif)
+///  9: ret USER_NOTIF           connect/bind/sendto/sendmmsg and non-ipc sendmsg
+/// 10: ret ALLOW                ipc handshake sendmsg — not subject to mediation
 /// ```
-fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
+fn build_seccomp_af_unix_filter(ipc_fd: std::os::unix::io::RawFd) -> Vec<SockFilterInsn> {
     vec![
         // 0: ld [nr]
         SockFilterInsn {
@@ -1995,24 +2036,24 @@ fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
             jf: 0,
             k: SECCOMP_DATA_NR_OFFSET,
         },
-        // 1: jeq SYS_CONNECT -> 7 (jt = 7-1-1 = 5)
+        // 1: jeq SYS_CONNECT -> 9 (jt = 9-1-1 = 7)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 5,
+            jt: 7,
             jf: 0,
             k: SYS_CONNECT as u32,
         },
-        // 2: jeq SYS_BIND -> 7 (jt = 7-2-1 = 4)
+        // 2: jeq SYS_BIND -> 9 (jt = 9-2-1 = 6)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 4,
+            jt: 6,
             jf: 0,
             k: SYS_BIND as u32,
         },
-        // 3: jeq SYS_SENDTO -> 7 (jt = 7-3-1 = 3)
+        // 3: jeq SYS_SENDTO -> 9 (jt = 9-3-1 = 5)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 3,
+            jt: 5,
             jf: 0,
             k: SYS_SENDTO as u32,
         },
@@ -2023,10 +2064,10 @@ fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
             jf: 0,
             k: SYS_SENDMSG as u32,
         },
-        // 5: jeq SYS_SENDMMSG -> 7 (jt = 7-5-1 = 1)
+        // 5: jeq SYS_SENDMMSG -> 9 (jt = 9-5-1 = 3)
         SockFilterInsn {
             code: BPF_JMP | BPF_JEQ | BPF_K,
-            jt: 1,
+            jt: 3,
             jf: 0,
             k: SYS_SENDMMSG as u32,
         },
@@ -2037,12 +2078,35 @@ fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
             jf: 0,
             k: SECCOMP_RET_ALLOW,
         },
-        // 7: ret USER_NOTIF
+        // 7: ld [args[0]] — check_fd: load sendmsg sockfd
+        SockFilterInsn {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_DATA_ARG0_OFFSET,
+        },
+        // 8: jeq ipc_fd jt=+1 (-> 10: allow) jf=0 (-> 9: notif)
+        // jf=0: not the ipc fd → fall to insn 9 (USER_NOTIF) for mediation.
+        // jt=1: is the ipc fd → skip insn 9, land on insn 10 (ALLOW).
+        SockFilterInsn {
+            code: BPF_JMP | BPF_JEQ | BPF_K,
+            jt: 1,
+            jf: 0,
+            k: ipc_fd as u32,
+        },
+        // 9: ret USER_NOTIF — non-ipc sendmsg: route to supervisor
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
             jf: 0,
             k: SECCOMP_RET_USER_NOTIF,
+        },
+        // 10: ret ALLOW — ipc handshake sendmsg
+        SockFilterInsn {
+            code: BPF_RET | BPF_K,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
         },
     ]
 }
@@ -2058,8 +2122,14 @@ fn build_seccomp_af_unix_filter() -> Vec<SockFilterInsn> {
 /// # Errors
 ///
 /// Returns an error if the seccomp syscall fails.
-pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd::OwnedFd> {
-    install_seccomp_notify_filter(&build_seccomp_proxy_filter(has_bind_ports), "proxy filter")
+pub fn install_seccomp_proxy_filter(
+    has_bind_ports: bool,
+    ipc_fd: std::os::unix::io::RawFd,
+) -> Result<std::os::fd::OwnedFd> {
+    install_seccomp_notify_filter(
+        &build_seccomp_proxy_filter(has_bind_ports, ipc_fd),
+        "proxy filter",
+    )
 }
 
 /// Install a seccomp-notify BPF filter for pathname AF_UNIX mediation.
@@ -2067,8 +2137,13 @@ pub fn install_seccomp_proxy_filter(has_bind_ports: bool) -> Result<std::os::fd:
 /// # Errors
 ///
 /// Returns an error if the seccomp syscall fails.
-pub fn install_seccomp_af_unix_filter() -> Result<std::os::fd::OwnedFd> {
-    install_seccomp_notify_filter(&build_seccomp_af_unix_filter(), "AF_UNIX mediation filter")
+pub fn install_seccomp_af_unix_filter(
+    ipc_fd: std::os::unix::io::RawFd,
+) -> Result<std::os::fd::OwnedFd> {
+    install_seccomp_notify_filter(
+        &build_seccomp_af_unix_filter(ipc_fd),
+        "AF_UNIX mediation filter",
+    )
 }
 
 fn install_seccomp_notify_filter(
@@ -3438,9 +3513,10 @@ mod tests {
 
     #[test]
     fn test_build_seccomp_proxy_filter_with_bind() {
-        let filter = build_seccomp_proxy_filter(true);
-        // 23 instructions
-        assert_eq!(filter.len(), 23);
+        let ipc_fd: std::os::unix::io::RawFd = 42;
+        let filter = build_seccomp_proxy_filter(true, ipc_fd);
+        // 27 instructions: original 23 + 4 for check_fd block
+        assert_eq!(filter.len(), 27);
 
         // Instruction 0 should be ld [nr]
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
@@ -3454,9 +3530,16 @@ mod tests {
         assert_eq!(filter[20].code, BPF_RET | BPF_K);
         assert_eq!(filter[20].k, SECCOMP_RET_USER_NOTIF);
 
-        // Instruction 21 should be USER_NOTIF (sendto/sendmsg/sendmmsg)
+        // Instruction 21 should be USER_NOTIF (sendto/sendmmsg)
         assert_eq!(filter[21].code, BPF_RET | BPF_K);
         assert_eq!(filter[21].k, SECCOMP_RET_USER_NOTIF);
+
+        // check_fd block for sendmsg
+        assert_eq!(filter[23].code, BPF_LD | BPF_W | BPF_ABS);
+        assert_eq!(filter[23].k, SECCOMP_DATA_ARG0_OFFSET);
+        assert_eq!(filter[24].k, ipc_fd as u32);
+        assert_eq!(filter[25].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(filter[26].k, SECCOMP_RET_ALLOW);
     }
 
     /// Regression test for the Landlock V2 + `has_bind_ports=false`
@@ -3466,8 +3549,9 @@ mod tests {
     /// ERRNO in this branch, unconditionally failing AF_UNIX bind.
     #[test]
     fn test_build_seccomp_proxy_filter_without_bind() {
-        let filter = build_seccomp_proxy_filter(false);
-        assert_eq!(filter.len(), 23);
+        let ipc_fd: std::os::unix::io::RawFd = 42;
+        let filter = build_seccomp_proxy_filter(false, ipc_fd);
+        assert_eq!(filter.len(), 27);
 
         // Instruction 20 (bind) must ALSO route to USER_NOTIF -- the
         // supervisor is the sole gate. This is the fix: previously this
@@ -3481,18 +3565,32 @@ mod tests {
     }
 
     #[test]
-    fn test_build_seccomp_af_unix_filter_notifies_connect_bind_sendto_sendmsg_sendmmsg() {
-        let filter = build_seccomp_af_unix_filter();
-        assert_eq!(filter.len(), 8);
+    fn test_build_seccomp_af_unix_filter_notifies_connect_bind_sendto_sendmmsg_mediates_sendmsg() {
+        let ipc_fd: std::os::unix::io::RawFd = 42;
+        let filter = build_seccomp_af_unix_filter(ipc_fd);
+        // 11 instructions: 0-5 dispatch, 6 ALLOW, 7-8 check_fd, 9 NOTIF, 10 ALLOW
+        assert_eq!(filter.len(), 11);
         assert_eq!(filter[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(filter[0].k, SECCOMP_DATA_NR_OFFSET);
         assert_eq!(filter[1].k, SYS_CONNECT as u32);
+        assert_eq!(filter[1].jt, 7); // -> insn 9 (USER_NOTIF)
         assert_eq!(filter[2].k, SYS_BIND as u32);
+        assert_eq!(filter[2].jt, 6); // -> insn 9 (USER_NOTIF)
         assert_eq!(filter[3].k, SYS_SENDTO as u32);
+        assert_eq!(filter[3].jt, 5); // -> insn 9 (USER_NOTIF)
         assert_eq!(filter[4].k, SYS_SENDMSG as u32);
+        assert_eq!(filter[4].jt, 2); // -> insn 7 (check_fd)
         assert_eq!(filter[5].k, SYS_SENDMMSG as u32);
+        assert_eq!(filter[5].jt, 3); // -> insn 9 (USER_NOTIF)
         assert_eq!(filter[6].k, SECCOMP_RET_ALLOW);
-        assert_eq!(filter[7].k, SECCOMP_RET_USER_NOTIF);
+        // check_fd block
+        assert_eq!(filter[7].code, BPF_LD | BPF_W | BPF_ABS);
+        assert_eq!(filter[7].k, SECCOMP_DATA_ARG0_OFFSET);
+        assert_eq!(filter[8].k, ipc_fd as u32); // jeq ipc_fd
+        assert_eq!(filter[8].jt, 1); // jt → insn 10 (ALLOW)
+        assert_eq!(filter[8].jf, 0); // jf → insn 9 (NOTIF)
+        assert_eq!(filter[9].k, SECCOMP_RET_USER_NOTIF);
+        assert_eq!(filter[10].k, SECCOMP_RET_ALLOW);
     }
 
     #[test]
@@ -3626,7 +3724,7 @@ mod tests {
 
             // Install the proxy filter (no bind ports).
             // This requires PR_SET_NO_NEW_PRIVS first.
-            let result = install_seccomp_proxy_filter(false);
+            let result = install_seccomp_proxy_filter(false, report_pipe[1]);
             if result.is_err() {
                 // Seccomp not available on this system
                 let payload: [u8; 3] = [2, 2, 2]; // skip sentinel
@@ -3803,7 +3901,7 @@ mod tests {
 
             // Install filter with `has_bind_ports=false` — this is the
             // exact configuration the #685 bug manifested under.
-            let notify_fd = match install_seccomp_proxy_filter(false) {
+            let notify_fd = match install_seccomp_proxy_filter(false, report_pipe[1]) {
                 Ok(fd) => fd,
                 Err(_) => {
                     // Seccomp unavailable — skip via sentinel.
@@ -4028,7 +4126,7 @@ mod tests {
             // Install proxy filter with has_bind_ports=false. As of the
             // #685 fix, bind() now routes to USER_NOTIF — so a handler
             // IS required even for the "block all bind" policy.
-            let notify_fd = match install_seccomp_proxy_filter(false) {
+            let notify_fd = match install_seccomp_proxy_filter(false, report_pipe[1]) {
                 Ok(fd) => fd,
                 Err(_) => {
                     // Seccomp not available — skip.

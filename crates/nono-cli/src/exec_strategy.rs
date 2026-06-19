@@ -931,9 +931,9 @@ pub fn execute_supervised(
                             }
                             _ => false,
                         };
-                        nono::sandbox::install_seccomp_proxy_filter(has_bind)
+                        nono::sandbox::install_seccomp_proxy_filter(has_bind, fd)
                     } else {
-                        nono::sandbox::install_seccomp_af_unix_filter()
+                        nono::sandbox::install_seccomp_af_unix_filter(fd)
                     };
 
                     match notify_result {
