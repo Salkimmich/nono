@@ -1957,7 +1957,7 @@ fn build_seccomp_proxy_filter(
             jf: 0,
             k: bind_action,
         },
-        // 21: ret USER_NOTIF -- sendto/sendmsg/sendmmsg
+        // 21: ret USER_NOTIF -- sendto/sendmmsg (sendmsg routes to check_fd at 23)
         SockFilterInsn {
             code: BPF_RET | BPF_K,
             jt: 0,
@@ -2002,16 +2002,26 @@ fn build_seccomp_proxy_filter(
     ]
 }
 
-/// Build a BPF filter for opt-in pathname AF_UNIX mediation.
+/// Build a BPF filter for opt-in pathname AF_UNIX mediation (Linux-only).
 ///
-/// The filter routes `connect()`, `bind()`, `sendto()`, `sendmsg()`, and `sendmmsg()`
-/// to the supervisor so it can inspect `sockaddr_un` paths. Everything
-/// else is allowed by this filter: TCP policy remains Landlock's job on
-/// V4+ kernels.
+/// Routes `connect()`, `bind()`, `sendto()`, `sendmmsg()`, and most
+/// `sendmsg()` calls to `USER_NOTIF` so the supervisor can inspect
+/// `sockaddr_un` paths. Everything else is allowed: TCP policy is
+/// Landlock's responsibility on V4+ kernels; this filter only handles
+/// AF_UNIX.
 ///
-/// The send syscalls route unconditionally. BPF cannot dereference
-/// `msghdr`/`mmsghdr`, and checking only half of a 64-bit `sendto` pointer
-/// is not a reliable NULL test.
+/// `sendmsg()` is special: it also carries the SCM_RIGHTS message that
+/// hands the seccomp notify fd from the child to the parent supervisor
+/// during the IPC handshake. If that `sendmsg()` were trapped, the child
+/// would block waiting for a supervisor decision while the parent is still
+/// in `recvmsg()` — a deadlock. `ipc_fd` is the child's end of the IPC
+/// socket pair; the filter allows `sendmsg()` unconditionally when
+/// `args[0] == ipc_fd` and routes all other `sendmsg()` calls to
+/// `USER_NOTIF` as normal.
+///
+/// BPF cannot dereference `msghdr`/`mmsghdr`, and checking only the
+/// low 32 bits of a 64-bit `sendto` destination pointer is not a
+/// reliable NULL test; the supervisor performs those checks instead.
 ///
 /// Instruction layout:
 /// ```text
@@ -2111,13 +2121,20 @@ fn build_seccomp_af_unix_filter(ipc_fd: std::os::unix::io::RawFd) -> Vec<SockFil
     ]
 }
 
-/// Install a seccomp-notify BPF filter for proxy-only network mode.
+/// Install a seccomp-notify BPF filter for proxy-only network mode (Linux-only).
 ///
-/// Returns the notify fd that the supervisor must poll for connect/bind
-/// notifications. Uses `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
+/// Used on kernels without Landlock V4 TCP support as a fallback: traps
+/// `connect()`, `bind()`, `sendto()`, `sendmmsg()`, and `sendmsg()` for
+/// supervisor mediation. Returns the notify fd the supervisor must poll.
+/// Uses `SECCOMP_FILTER_FLAG_NEW_LISTENER`.
 ///
-/// Must be called AFTER `PR_SET_NO_NEW_PRIVS` is already set (either by
-/// a prior seccomp install or by Landlock's `restrict_self()`).
+/// `ipc_fd` is the child's end of the supervisor IPC socket pair. The
+/// filter exempts `sendmsg()` on this specific fd so the SCM_RIGHTS
+/// handshake that delivers the notify fd to the parent can complete
+/// without deadlocking.
+///
+/// Must be called after `PR_SET_NO_NEW_PRIVS` is set (either by a prior
+/// seccomp install or by Landlock's `restrict_self()`).
 ///
 /// # Errors
 ///
@@ -2132,7 +2149,19 @@ pub fn install_seccomp_proxy_filter(
     )
 }
 
-/// Install a seccomp-notify BPF filter for pathname AF_UNIX mediation.
+/// Install a seccomp-notify BPF filter for pathname AF_UNIX mediation (Linux-only).
+///
+/// Enables `linux.af_unix_mediation: pathname` enforcement: traps AF_UNIX
+/// `connect()`, `bind()`, `sendto()`, `sendmmsg()`, and `sendmsg()` and
+/// routes them to the supervisor, which checks `sockaddr_un.sun_path`
+/// against the `unix_sockets` allowlist. Connections to unlisted paths
+/// are denied with `EACCES`. Returns the notify fd the supervisor must poll.
+///
+/// `ipc_fd` is the child's end of the supervisor IPC socket pair. The
+/// filter exempts `sendmsg()` on this fd so the SCM_RIGHTS handshake
+/// that delivers the notify fd to the parent completes without deadlocking.
+///
+/// Must be called after `PR_SET_NO_NEW_PRIVS` is set.
 ///
 /// # Errors
 ///
