@@ -304,6 +304,10 @@ impl PreparedToolSandboxRuntime {
             shim_count
         );
 
+        // Reset once so the ELF-resolution memo caches span both closure-building
+        // batches below (outer-exec gate + baseline cache): each shared object is
+        // canonicalized / resolved / read / stat'd once per launch, not per batch.
+        reset_elf_resolution_cache();
         let start_outer_exec = std::time::Instant::now();
         let allowed_outer_exec_files = build_outer_exec_files(
             shims_by_command.values().chain(url_open_shim.iter()),
@@ -2728,7 +2732,6 @@ fn build_outer_exec_files<'a>(
     plan: &ResolvedToolSandboxPlan,
     shim_source: &Path,
 ) -> Result<Vec<PathBuf>> {
-    reset_elf_resolution_cache();
     let controlled_ids = controlled_exec_ids(plan);
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
@@ -3384,7 +3387,6 @@ fn build_baseline_cache<'a>(
     shims: impl IntoIterator<Item = &'a ShimIdentity>,
     shim_source: &Path,
 ) -> Result<BaselineCache> {
-    reset_elf_resolution_cache();
     let system_files = compute_system_baseline_files()?;
     let mut closures: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
 
@@ -4541,6 +4543,9 @@ thread_local! {
     /// so each shared object is read+parsed once per pass rather than once per
     /// dependency closure that references it.
     static ELF_PARSE_CACHE: RefCell<HashMap<PathBuf, ParsedElf>> = RefCell::new(HashMap::new());
+    /// Memoizes file identity (dev+ino) keyed by canonical path, so the per-edge
+    /// `statx` used for closure dedup runs once per file per pass.
+    static ELF_FILEID_CACHE: RefCell<HashMap<PathBuf, FileId>> = RefCell::new(HashMap::new());
 }
 
 /// Clears the per-pass ELF-resolution memo caches. Called at the start of each
@@ -4550,6 +4555,7 @@ fn reset_elf_resolution_cache() {
     ELF_CANON_CACHE.with(|cache| cache.borrow_mut().clear());
     ELF_LIB_CACHE.with(|cache| cache.borrow_mut().clear());
     ELF_PARSE_CACHE.with(|cache| cache.borrow_mut().clear());
+    ELF_FILEID_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Canonicalize `path`, memoized via [`ELF_CANON_CACHE`] for the current pass.
@@ -4571,6 +4577,22 @@ fn cached_canonicalize(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// File identity (dev+ino) for `canonical`, memoized via [`ELF_FILEID_CACHE`].
+fn cached_file_id(canonical: &Path) -> Result<FileId> {
+    if let Some(id) = ELF_FILEID_CACHE.with(|cache| cache.borrow().get(canonical).copied()) {
+        return Ok(id);
+    }
+    let metadata = fs::metadata(canonical).map_err(|source| NonoError::ConfigRead {
+        path: canonical.to_path_buf(),
+        source,
+    })?;
+    let id = file_id(&metadata);
+    ELF_FILEID_CACHE.with(|cache| {
+        cache.borrow_mut().insert(canonical.to_path_buf(), id);
+    });
+    Ok(id)
+}
+
 fn elf_dependency_closure(binary: &Path) -> Result<Vec<PathBuf>> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -4584,11 +4606,7 @@ fn resolve_elf_recursive(
     result: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let canonical = cached_canonicalize(path)?;
-    let metadata = fs::metadata(&canonical).map_err(|source| NonoError::ConfigRead {
-        path: canonical.clone(),
-        source,
-    })?;
-    if !seen.insert(file_id(&metadata)) {
+    if !seen.insert(cached_file_id(&canonical)?) {
         return Ok(());
     }
     result.push(canonical.clone());
