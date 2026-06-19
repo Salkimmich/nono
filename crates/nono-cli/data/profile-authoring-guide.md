@@ -460,7 +460,7 @@ Use `filesystem.deny` on the socket path. Seatbelt treats `connect(2)` as a netw
 
 #### Linux
 
-Landlock cannot express deny-within-allow, so `filesystem.deny` is a no-op on Linux. Instead, enable `linux.af_unix_mediation` to switch to a default-deny seccomp supervisor for AF_UNIX pathname sockets, then add back only the sockets the agent needs via `unix_sockets`:
+Landlock cannot express deny-within-allow, so `filesystem.deny` is a no-op on Linux. Instead, enable `linux.af_unix_mediation` to switch to a default-deny seccomp supervisor for AF_UNIX pathname sockets, then add back only the sockets the agent needs via `filesystem.unix_socket`:
 
 ```json
 {
@@ -475,14 +475,14 @@ Landlock cannot express deny-within-allow, so `filesystem.deny` is a no-op on Li
 }
 ```
 
-With no `unix_sockets` entries, every AF_UNIX pathname connect and bind is blocked — including `/run/docker.sock`. To allow specific sockets back (e.g. tmux, D-Bus), add them explicitly:
+With no `filesystem.unix_socket` entries, every AF_UNIX pathname connect and bind is blocked — including `/run/docker.sock`. To allow specific sockets back (e.g. tmux, D-Bus), add them explicitly:
 
 ```json
 {
   "linux": { "af_unix_mediation": "pathname" },
-  "unix_sockets": [
-    { "path": "/run/user/1000/bus", "ops": ["connect"] }
-  ]
+  "filesystem": {
+    "unix_socket": ["/run/user/1000/bus"]
+  }
 }
 ```
 
