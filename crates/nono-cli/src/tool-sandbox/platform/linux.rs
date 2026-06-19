@@ -4537,6 +4537,10 @@ thread_local! {
     /// — the only inputs that determine the result.
     static ELF_LIB_CACHE: RefCell<HashMap<(String, Vec<String>), PathBuf>> =
         RefCell::new(HashMap::new());
+    /// Memoizes `parse_elf` (which reads the whole file) keyed by canonical path,
+    /// so each shared object is read+parsed once per pass rather than once per
+    /// dependency closure that references it.
+    static ELF_PARSE_CACHE: RefCell<HashMap<PathBuf, ParsedElf>> = RefCell::new(HashMap::new());
 }
 
 /// Clears the per-pass ELF-resolution memo caches. Called at the start of each
@@ -4545,6 +4549,7 @@ thread_local! {
 fn reset_elf_resolution_cache() {
     ELF_CANON_CACHE.with(|cache| cache.borrow_mut().clear());
     ELF_LIB_CACHE.with(|cache| cache.borrow_mut().clear());
+    ELF_PARSE_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Canonicalize `path`, memoized via [`ELF_CANON_CACHE`] for the current pass.
@@ -4587,7 +4592,7 @@ fn resolve_elf_recursive(
         return Ok(());
     }
     result.push(canonical.clone());
-    let parsed = parse_elf(&canonical)?;
+    let parsed = parse_elf_cached(&canonical)?;
     if let Some(interpreter) = parsed.interpreter {
         resolve_elf_recursive(&interpreter, seen, result)?;
     }
@@ -4598,10 +4603,26 @@ fn resolve_elf_recursive(
     Ok(())
 }
 
+#[derive(Clone)]
 struct ParsedElf {
     interpreter: Option<PathBuf>,
     needed: Vec<String>,
     search_dirs: Vec<String>,
+}
+
+/// `parse_elf`, memoized via [`ELF_PARSE_CACHE`] for the current pass. `canonical`
+/// must already be canonicalized (the cache key is the canonical path).
+fn parse_elf_cached(canonical: &Path) -> Result<ParsedElf> {
+    if let Some(parsed) = ELF_PARSE_CACHE.with(|cache| cache.borrow().get(canonical).cloned()) {
+        return Ok(parsed);
+    }
+    let parsed = parse_elf(canonical)?;
+    ELF_PARSE_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .insert(canonical.to_path_buf(), parsed.clone());
+    });
+    Ok(parsed)
 }
 
 #[derive(Clone, Copy)]
