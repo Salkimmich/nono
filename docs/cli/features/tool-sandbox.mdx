@@ -92,6 +92,36 @@ The selected `sandbox` object describes what the child receives:
 | `allow_launch_services` | boolean | macOS-only direct LaunchServices URL opening. |
 | `allow_raw_file_credentials_in_chained_policy` | boolean | Required before non-session callers can receive raw-file credentials. |
 
+### Dynamic Filesystem Grants
+
+`fs_read`, `fs_write`, `fs_read_file`, and `fs_write_file` can contain dynamic provider tokens as well as literal paths. Tokens are expanded at launch before the child sandbox is built. They are opt-in: no dynamic paths are added unless a selected command policy includes one of these tokens.
+
+Supported tokens:
+
+| Token | Use in | Expands to |
+|---|---|---|
+| `@git:config-files` | `fs_read_file` | Trusted global/system Git config files and configured Git file paths, such as attributes, excludes, and commit template files. |
+| `@git:hooks-path` | `fs_read` | Trusted global/system `core.hooksPath` directories. |
+
+Example:
+
+```json
+{
+  "command_policies": {
+    "commands": {
+      "git": {
+        "sandbox": {
+          "fs_read_file": ["@git:config-files"],
+          "fs_read": ["@git:hooks-path"]
+        }
+      }
+    }
+  }
+}
+```
+
+The Git provider reads `git config --list --show-origin --show-scope` and keeps only `global` and `system` scoped paths. It ignores `local` and `worktree` scopes so a repository cannot grant itself additional host filesystem access through `.git/config`. If `git` is unavailable or returns no matching paths, the token expands to no paths.
+
 `network` accepts these values:
 
 | Field | Value | Notes |
