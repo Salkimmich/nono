@@ -6,7 +6,7 @@
 #
 #   - `--profile <install_as>` resolves through the pack-store branch of
 #     load_profile (the same branch the pull/migration flow uses).
-#   - Sandbox enforcement honours the resolved pack-shipped profile.
+#   - Sandbox enforcement honours the same pack-shipped profile contents.
 #   - Cleanup removes the pack-store entry without leaving lockfile state.
 #
 # Why hand-install rather than `nono pull`: pull goes through Sigstore
@@ -18,8 +18,10 @@
 #   - end-to-end smoke tests in nono-packs CI
 #
 # This suite is specifically about: when a pack IS installed, does
-# `--profile <name>` find it and apply it correctly through the
-# user-facing CLI.
+# `--profile <name>` find it through the user-facing CLI. Real execution
+# verifies pack lockfile and Sigstore metadata, so enforcement below uses
+# the exact fixture profile file by path rather than treating the
+# hand-installed fixture as a trusted registry install.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/../lib/test_helpers.sh"
@@ -51,6 +53,7 @@ export XDG_CONFIG_HOME="$TMPDIR/xdg-config"
 PACK_STORE="$XDG_CONFIG_HOME/nono/packages/test-ns/synthetic"
 mkdir -p "$PACK_STORE"
 cp -R "$FIXTURE_DIR/." "$PACK_STORE/"
+SYNTHETIC_PROFILE="$PACK_STORE/profiles/synthetic.json"
 
 # Workdir for the sandboxed command — granted to `synthetic` profile
 # via $WORKDIR expansion.
@@ -91,14 +94,17 @@ echo ""
 echo "--- Pack-Profile Enforcement ---"
 
 # The synthetic profile grants $WORKDIR. Reading a file inside should work.
+# Use the profile file directly here: short-name pack-store execution is
+# gated by lockfile + Sigstore verification, which this hand-installed
+# resolver fixture intentionally does not provide.
 expect_success "synthetic profile grants workdir read" \
-    bash -lc "cd \"$TMPDIR/workdir\" && \"$NONO_BIN_ABS\" run --profile synthetic --allow-cwd -- cat data.txt"
+    bash -lc "cd \"$TMPDIR/workdir\" && \"$NONO_BIN_ABS\" run --profile \"$SYNTHETIC_PROFILE\" --allow-cwd -- cat data.txt"
 
 # Outside-workdir paths should NOT be granted by the synthetic profile.
 # Picking a path that's never in any embedded baseline group (so the
 # failure is unambiguous).
 expect_failure "synthetic profile denies arbitrary outside-workdir path" \
-    "$NONO_BIN" run --profile synthetic --workdir "$TMPDIR/workdir" --allow-cwd -- cat /etc/shadow
+    "$NONO_BIN" run --profile "$SYNTHETIC_PROFILE" --workdir "$TMPDIR/workdir" --allow-cwd -- cat /etc/shadow
 
 # =============================================================================
 # Cleanup behaviour (resolver no longer finds it after removal)

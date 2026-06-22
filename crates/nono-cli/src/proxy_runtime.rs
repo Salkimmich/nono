@@ -76,6 +76,49 @@ struct CachedCapturedCredential {
 }
 
 #[derive(Debug)]
+struct CaptureErrorDetails {
+    action: &'static str,
+    exit_status: Option<i32>,
+    duration: Duration,
+    stdout_bytes: Option<usize>,
+    stderr_redacted: Option<String>,
+    reason: Option<String>,
+}
+
+impl CaptureErrorDetails {
+    fn new(action: &'static str, duration: Duration) -> Self {
+        Self {
+            action,
+            exit_status: None,
+            duration,
+            stdout_bytes: None,
+            stderr_redacted: None,
+            reason: None,
+        }
+    }
+
+    fn exit_status(mut self, exit_status: Option<i32>) -> Self {
+        self.exit_status = exit_status;
+        self
+    }
+
+    fn stdout_bytes(mut self, stdout_bytes: usize) -> Self {
+        self.stdout_bytes = Some(stdout_bytes);
+        self
+    }
+
+    fn stderr_redacted(mut self, stderr_redacted: Option<String>) -> Self {
+        self.stderr_redacted = stderr_redacted;
+        self
+    }
+
+    fn reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
+        self
+    }
+}
+
+#[derive(Debug)]
 struct ProxyCredentialCaptureBackend {
     session_id: String,
     entries: HashMap<String, ResolvedCredentialCaptureEntry>,
@@ -193,10 +236,9 @@ impl ProxyCredentialCaptureBackend {
     ) -> String {
         if let Some(regex) = &entry.cache_path_regex
             && let Some(captures) = regex.captures(&request.request_path)
+            && let Some(scope) = captures.get(1).or_else(|| captures.get(0))
         {
-            if let Some(scope) = captures.get(1).or_else(|| captures.get(0)) {
-                return scope.as_str().to_string();
-            }
+            return scope.as_str().to_string();
         }
         request.request_host.clone()
     }
@@ -266,12 +308,7 @@ impl ProxyCredentialCaptureBackend {
         let browser_bridge = prepare_capture_browser_bridge(entry, request).map_err(|err| {
             self.capture_error(
                 entry,
-                "browser_setup_failed",
-                None,
-                start.elapsed(),
-                None,
-                None,
-                Some(format!(
+                CaptureErrorDetails::new("browser_setup_failed", start.elapsed()).reason(format!(
                     "failed to prepare credential capture browser support: {err}"
                 )),
             )
@@ -301,14 +338,9 @@ impl ProxyCredentialCaptureBackend {
             let joined = std::env::join_paths(paths).map_err(|err| {
                 self.capture_error(
                     entry,
-                    "browser_setup_failed",
-                    None,
-                    start.elapsed(),
-                    None,
-                    None,
-                    Some(format!(
-                        "failed to prepare credential capture browser PATH: {err}"
-                    )),
+                    CaptureErrorDetails::new("browser_setup_failed", start.elapsed()).reason(
+                        format!("failed to prepare credential capture browser PATH: {err}"),
+                    ),
                 )
             })?;
             command.env("PATH", joined);
@@ -329,12 +361,8 @@ impl ProxyCredentialCaptureBackend {
         let mut child = command.spawn().map_err(|err| {
             self.capture_error(
                 entry,
-                "spawn_failed",
-                None,
-                start.elapsed(),
-                None,
-                None,
-                Some(format!("failed to start credential capture command: {err}")),
+                CaptureErrorDetails::new("spawn_failed", start.elapsed())
+                    .reason(format!("failed to start credential capture command: {err}")),
             )
         })?;
         if entry.stdin_mode == crate::profile::CredentialCaptureStdinMode::RequestJson {
@@ -351,12 +379,7 @@ impl ProxyCredentialCaptureBackend {
                 let bytes = serde_json::to_vec(&stdin_payload).map_err(|err| {
                     self.capture_error(
                         entry,
-                        "stdin_failed",
-                        None,
-                        start.elapsed(),
-                        None,
-                        None,
-                        Some(format!(
+                        CaptureErrorDetails::new("stdin_failed", start.elapsed()).reason(format!(
                             "failed to serialize credential capture stdin: {err}"
                         )),
                     )
@@ -364,12 +387,8 @@ impl ProxyCredentialCaptureBackend {
                 stdin.write_all(&bytes).map_err(|err| {
                     self.capture_error(
                         entry,
-                        "stdin_failed",
-                        None,
-                        start.elapsed(),
-                        None,
-                        None,
-                        Some(format!("failed to write credential capture stdin: {err}")),
+                        CaptureErrorDetails::new("stdin_failed", start.elapsed())
+                            .reason(format!("failed to write credential capture stdin: {err}")),
                     )
                 })?;
             }
@@ -382,12 +401,7 @@ impl ProxyCredentialCaptureBackend {
                 Err(err) => {
                     return Err(self.capture_error(
                         entry,
-                        "wait_failed",
-                        None,
-                        start.elapsed(),
-                        None,
-                        None,
-                        Some(format!(
+                        CaptureErrorDetails::new("wait_failed", start.elapsed()).reason(format!(
                             "failed to wait for credential capture command: {err}"
                         )),
                     ));
@@ -398,12 +412,7 @@ impl ProxyCredentialCaptureBackend {
                 let _ = child.wait();
                 return Err(self.capture_error(
                     entry,
-                    "timeout",
-                    None,
-                    start.elapsed(),
-                    None,
-                    None,
-                    Some(format!(
+                    CaptureErrorDetails::new("timeout", start.elapsed()).reason(format!(
                         "credential capture command timed out after {}s",
                         entry.timeout.as_secs()
                     )),
@@ -415,12 +424,7 @@ impl ProxyCredentialCaptureBackend {
         let output = child.wait_with_output().map_err(|err| {
             self.capture_error(
                 entry,
-                "collect_failed",
-                None,
-                start.elapsed(),
-                None,
-                None,
-                Some(format!(
+                CaptureErrorDetails::new("collect_failed", start.elapsed()).reason(format!(
                     "failed to collect credential capture command output: {err}"
                 )),
             )
@@ -430,15 +434,13 @@ impl ProxyCredentialCaptureBackend {
             let stderr_redacted = redacted_stderr(&output.stderr, &self.redaction_policy);
             return Err(self.capture_error(
                 entry,
-                "command_failed",
-                status_code,
-                start.elapsed(),
-                None,
-                stderr_redacted,
-                Some(format!(
-                    "credential capture command failed with exit code {}",
-                    status_code.map_or_else(|| "unknown".to_string(), |code| code.to_string())
-                )),
+                CaptureErrorDetails::new("command_failed", start.elapsed())
+                    .exit_status(status_code)
+                    .stderr_redacted(stderr_redacted)
+                    .reason(format!(
+                        "credential capture command failed with exit code {}",
+                        status_code.map_or_else(|| "unknown".to_string(), |code| code.to_string())
+                    )),
             ));
         }
         let mut stdout = output.stdout;
@@ -450,26 +452,23 @@ impl ProxyCredentialCaptureBackend {
             let stderr_redacted = redacted_stderr(&output.stderr, &self.redaction_policy);
             return Err(self.capture_error(
                 entry,
-                "empty_stdout",
-                status_code,
-                start.elapsed(),
-                Some(stdout_bytes),
-                stderr_redacted,
-                Some("credential capture command produced empty stdout".to_string()),
+                CaptureErrorDetails::new("empty_stdout", start.elapsed())
+                    .exit_status(status_code)
+                    .stdout_bytes(stdout_bytes)
+                    .stderr_redacted(stderr_redacted)
+                    .reason("credential capture command produced empty stdout"),
             ));
         }
         let value = String::from_utf8(stdout).map_err(|err| {
             let stderr_redacted = redacted_stderr(&output.stderr, &self.redaction_policy);
             self.capture_error(
                 entry,
-                "non_utf8_stdout",
-                status_code,
-                start.elapsed(),
-                None,
-                stderr_redacted,
-                Some(format!(
-                    "credential capture command produced non-UTF-8 stdout: {err}"
-                )),
+                CaptureErrorDetails::new("non_utf8_stdout", start.elapsed())
+                    .exit_status(status_code)
+                    .stderr_redacted(stderr_redacted)
+                    .reason(format!(
+                        "credential capture command produced non-UTF-8 stdout: {err}"
+                    )),
             )
         })?;
 
@@ -483,12 +482,10 @@ impl ProxyCredentialCaptureBackend {
                     parse_capture_headers_json(&value, &entry.allow_headers).map_err(|reason| {
                         self.capture_error(
                             entry,
-                            "invalid_json_output",
-                            status_code,
-                            start.elapsed(),
-                            Some(stdout_bytes),
-                            None,
-                            Some(reason),
+                            CaptureErrorDetails::new("invalid_json_output", start.elapsed())
+                                .exit_status(status_code)
+                                .stdout_bytes(stdout_bytes)
+                                .reason(reason),
                         )
                     })?;
                 let names = headers.iter().map(|(name, _)| name.clone()).collect();
@@ -521,30 +518,27 @@ impl ProxyCredentialCaptureBackend {
     fn capture_error(
         &self,
         entry: &ResolvedCredentialCaptureEntry,
-        action: &str,
-        exit_status: Option<i32>,
-        duration: Duration,
-        stdout_bytes: Option<usize>,
-        stderr_redacted: Option<String>,
-        reason: Option<String>,
+        details: CaptureErrorDetails,
     ) -> nono_proxy::capture::CredentialCaptureError {
-        nono_proxy::capture::CredentialCaptureError {
-            reason: reason.unwrap_or_else(|| "credential capture failed".to_string()),
-            metadata: nono_proxy::capture::CredentialCaptureMetadata {
-                cache_action: action.to_string(),
+        nono_proxy::capture::CredentialCaptureError::new(
+            details
+                .reason
+                .unwrap_or_else(|| "credential capture failed".to_string()),
+            nono_proxy::capture::CredentialCaptureMetadata {
+                cache_action: details.action.to_string(),
                 command: Some(entry.command_path.to_string_lossy().into_owned()),
                 argv: scrub_capture_argv(&entry.args, &self.redaction_policy),
-                exit_status,
-                duration_ms: millis_u64(duration),
-                stdout_bytes,
-                stderr_redacted,
+                exit_status: details.exit_status,
+                duration_ms: millis_u64(details.duration),
+                stdout_bytes: details.stdout_bytes,
+                stderr_redacted: details.stderr_redacted,
                 cache_scope: None,
                 output_format: Some(capture_output_format_name(entry.output_format).to_string()),
                 header_names: Vec::new(),
                 stdin_mode: Some(capture_stdin_mode_name(entry.stdin_mode).to_string()),
                 interactive: Some(entry.interactive),
             },
-        }
+        )
     }
 }
 
@@ -557,16 +551,16 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
         nono_proxy::capture::CredentialCaptureError,
     > {
         let Some(entry) = self.entries.get(&request.credential_name) else {
-            return Err(nono_proxy::capture::CredentialCaptureError {
-                reason: format!(
+            return Err(nono_proxy::capture::CredentialCaptureError::new(
+                format!(
                     "credential capture '{}' is not configured",
                     request.credential_name
                 ),
-                metadata: nono_proxy::capture::CredentialCaptureMetadata {
+                nono_proxy::capture::CredentialCaptureMetadata {
                     cache_action: "unknown_credential".to_string(),
                     ..Default::default()
                 },
-            });
+            ));
         };
         let cache_scope = Self::capture_cache_scope(entry, &request);
         request.session_id = self.session_id.clone();
@@ -575,16 +569,15 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
         let guard = loop {
             let now = Instant::now();
             {
-                let mut cache =
-                    self.cache
-                        .lock()
-                        .map_err(|_| nono_proxy::capture::CredentialCaptureError {
-                            reason: "credential capture cache lock poisoned".to_string(),
-                            metadata: nono_proxy::capture::CredentialCaptureMetadata {
-                                cache_action: "cache_error".to_string(),
-                                ..Default::default()
-                            },
-                        })?;
+                let mut cache = self.cache.lock().map_err(|_| {
+                    nono_proxy::capture::CredentialCaptureError::new(
+                        "credential capture cache lock poisoned".to_string(),
+                        nono_proxy::capture::CredentialCaptureMetadata {
+                            cache_action: "cache_error".to_string(),
+                            ..Default::default()
+                        },
+                    )
+                })?;
                 if let Some(cached) = cache.get(&key)
                     && cached.expires_at > now
                 {
@@ -612,9 +605,9 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
             }
 
             if let Some(guard) = self.try_enter_capture(&key).map_err(|reason| {
-                nono_proxy::capture::CredentialCaptureError {
+                nono_proxy::capture::CredentialCaptureError::new(
                     reason,
-                    metadata: nono_proxy::capture::CredentialCaptureMetadata {
+                    nono_proxy::capture::CredentialCaptureMetadata {
                         cache_action: "active_set_error".to_string(),
                         command: Some(entry.command_path.to_string_lossy().into_owned()),
                         argv: scrub_capture_argv(&entry.args, &self.redaction_policy),
@@ -626,15 +619,15 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
                         interactive: Some(entry.interactive),
                         ..Default::default()
                     },
-                }
+                )
             })? {
                 break guard;
             }
 
             self.wait_for_active_capture(&key).map_err(|reason| {
-                nono_proxy::capture::CredentialCaptureError {
+                nono_proxy::capture::CredentialCaptureError::new(
                     reason,
-                    metadata: nono_proxy::capture::CredentialCaptureMetadata {
+                    nono_proxy::capture::CredentialCaptureMetadata {
                         cache_action: "wait_failed".to_string(),
                         command: Some(entry.command_path.to_string_lossy().into_owned()),
                         argv: scrub_capture_argv(&entry.args, &self.redaction_policy),
@@ -646,7 +639,7 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
                         interactive: Some(entry.interactive),
                         ..Default::default()
                     },
-                }
+                )
             })?;
         };
         let response = self
@@ -658,16 +651,15 @@ impl nono_proxy::capture::CredentialCaptureBackend for ProxyCredentialCaptureBac
                 err
             })?;
         if !entry.ttl.is_zero() {
-            let mut cache =
-                self.cache
-                    .lock()
-                    .map_err(|_| nono_proxy::capture::CredentialCaptureError {
-                        reason: "credential capture cache lock poisoned".to_string(),
-                        metadata: nono_proxy::capture::CredentialCaptureMetadata {
-                            cache_action: "cache_error".to_string(),
-                            ..Default::default()
-                        },
-                    })?;
+            let mut cache = self.cache.lock().map_err(|_| {
+                nono_proxy::capture::CredentialCaptureError::new(
+                    "credential capture cache lock poisoned".to_string(),
+                    nono_proxy::capture::CredentialCaptureMetadata {
+                        cache_action: "cache_error".to_string(),
+                        ..Default::default()
+                    },
+                )
+            })?;
             cache.insert(
                 key,
                 CachedCapturedCredential {

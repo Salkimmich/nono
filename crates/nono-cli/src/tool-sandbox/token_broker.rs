@@ -465,7 +465,9 @@ mod tests {
         // Not admitted
         assert!(broker.resolve_nonce(&n, "cmd.curl").is_none());
         // issue_named inherits grants
-        let n2 = broker.issue_named("gitlab").unwrap();
+        let n2 = broker
+            .issue_named("gitlab")
+            .expect("stored gitlab credential should be available");
         assert!(broker.resolve_nonce(&n2, "cmd.glab").is_some());
         assert!(broker.resolve_nonce(&n2, "cmd.curl").is_none());
     }

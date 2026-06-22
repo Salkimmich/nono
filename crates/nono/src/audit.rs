@@ -81,7 +81,7 @@ pub enum AuditEventPayload {
     /// Network audit event.
     Network {
         /// Network audit event emitted by the proxy or sandbox supervisor.
-        event: NetworkAuditEvent,
+        event: Box<NetworkAuditEvent>,
     },
     /// Sandbox runtime metadata.
     SandboxRuntime {
@@ -476,7 +476,9 @@ impl AuditRecorder {
 
     /// Record a network event.
     pub fn record_network_event(&mut self, event: NetworkAuditEvent) -> Result<()> {
-        self.append_event(AuditEventPayload::Network { event })
+        self.append_event(AuditEventPayload::Network {
+            event: Box::new(event),
+        })
     }
 
     /// Record sandbox runtime metadata.

@@ -62,7 +62,16 @@ pub struct CredentialCaptureResponse {
 #[derive(Debug, Clone)]
 pub struct CredentialCaptureError {
     pub reason: String,
-    pub metadata: CredentialCaptureMetadata,
+    pub metadata: Box<CredentialCaptureMetadata>,
+}
+
+impl CredentialCaptureError {
+    pub fn new(reason: String, metadata: CredentialCaptureMetadata) -> Self {
+        Self {
+            reason,
+            metadata: Box::new(metadata),
+        }
+    }
 }
 
 impl std::fmt::Display for CredentialCaptureError {
