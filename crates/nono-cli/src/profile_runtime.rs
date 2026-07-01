@@ -23,6 +23,8 @@ pub(crate) struct PreparedProfile {
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
+    pub(crate) credential_providers: HashMap<String, profile::CredentialProviderDef>,
+    pub(crate) credential_routes: Vec<profile::CredentialRouteDef>,
     pub(crate) tls_intercept: Option<profile::TlsInterceptConfig>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
@@ -508,6 +510,45 @@ fn collect_ignored_denial_paths(
     paths
 }
 
+fn precreate_file_json_credential_store_dirs(
+    loaded_profile: Option<&profile::Profile>,
+    workdir: &Path,
+) {
+    let Some(loaded_profile) = loaded_profile else {
+        return;
+    };
+
+    for (provider_name, provider) in &loaded_profile.credential_providers {
+        let Some(profile::CredentialProviderStore::FileJson { path, .. }) =
+            &provider.credential_store
+        else {
+            continue;
+        };
+        let expanded = match profile::expand_vars(path, workdir) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to expand file_json credential store path for provider {}: {}",
+                    provider_name,
+                    error
+                );
+                continue;
+            }
+        };
+        let Some(parent) = expanded.parent() else {
+            continue;
+        };
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                "Failed to pre-create file_json credential store directory {} for provider {}: {}",
+                parent.display(),
+                provider_name,
+                error
+            );
+        }
+    }
+}
+
 fn prepare_profile_with_options(
     args: &SandboxArgs,
     workdir: &Path,
@@ -589,6 +630,8 @@ fn prepare_profile_with_options(
         None
     };
 
+    precreate_file_json_credential_store_dirs(loaded_profile.as_ref(), workdir);
+
     Ok(PreparedProfile {
         capability_elevation: loaded_profile
             .as_ref()
@@ -641,6 +684,14 @@ fn prepare_profile_with_options(
         custom_credentials: loaded_profile
             .as_ref()
             .map(|profile| profile.network.custom_credentials.clone())
+            .unwrap_or_default(),
+        credential_providers: loaded_profile
+            .as_ref()
+            .map(|profile| profile.credential_providers.clone())
+            .unwrap_or_default(),
+        credential_routes: loaded_profile
+            .as_ref()
+            .map(|profile| profile.credential_routes.clone())
             .unwrap_or_default(),
         tls_intercept: loaded_profile
             .as_ref()
@@ -931,6 +982,42 @@ mod tests {
         let result = expand_profile_set_vars(Some(&profile), Path::new("/tmp/work"))
             .expect("expansion should succeed");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn precreate_file_json_credential_store_creates_parent_dir_only() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let tmp = tempdir().expect("tmpdir");
+        let home = tmp.path().join("home");
+        fs::create_dir(&home).expect("create home");
+        let _env =
+            crate::test_env::EnvVarGuard::set_all(&[("HOME", home.to_str().expect("utf8 home"))]);
+
+        let mut profile = profile::Profile::default();
+        profile.credential_providers.insert(
+            "codex_openai".to_string(),
+            profile::CredentialProviderDef {
+                provider_type: profile::CredentialProviderType::OauthCapture,
+                token_endpoints: Vec::new(),
+                api_hosts: Vec::new(),
+                credential_store: Some(profile::CredentialProviderStore::FileJson {
+                    path: "$HOME/.codex-nono-oauth/auth.json".to_string(),
+                    phantom_fields: vec!["tokens.access_token".to_string()],
+                }),
+                helpers: None,
+            },
+        );
+
+        let store_path = home.join(".codex-nono-oauth").join("auth.json");
+        assert!(!store_path.parent().expect("parent").exists());
+
+        precreate_file_json_credential_store_dirs(Some(&profile), Path::new("/tmp/work"));
+
+        assert!(store_path.parent().expect("parent").is_dir());
+        assert!(!store_path.exists());
     }
 
     /// Build a minimal pack on disk under `<config_dir>/nono/packages/<ns>/<name>/`
