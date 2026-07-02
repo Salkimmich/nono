@@ -530,6 +530,14 @@ impl CommandFromConfig {
             Self::Deny(_) => None,
         }
     }
+
+    fn sandbox_mut(&mut self) -> Option<&mut CommandSandboxConfig> {
+        match self {
+            Self::Edge(edge) => Some(&mut edge.sandbox),
+            Self::Policy(policy) => Some(policy),
+            Self::Deny(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -2494,6 +2502,28 @@ fn push_unsafe_seatbelt_rules(
     }
 }
 
+/// Clears `unsafe_macos_seatbelt_rules` nested inside command sandboxes,
+/// `from.<caller>` edges, and intercept rule sandbox overrides. Used to
+/// enforce that raw Seatbelt rules are honoured only for user-authored
+/// profiles — see `command_runtime::strip_untrusted_unsafe_seatbelt_rules`.
+pub(crate) fn clear_unsafe_seatbelt_rules(policies: &mut CommandPoliciesConfig) {
+    for command in policies.commands.values_mut() {
+        if let Some(sandbox) = &mut command.sandbox {
+            sandbox.unsafe_macos_seatbelt_rules.clear();
+        }
+        for from in command.from.values_mut() {
+            if let Some(sandbox) = from.sandbox_mut() {
+                sandbox.unsafe_macos_seatbelt_rules.clear();
+            }
+        }
+        for rule in &mut command.intercept {
+            if let Some(sandbox) = &mut rule.sandbox {
+                sandbox.unsafe_macos_seatbelt_rules.clear();
+            }
+        }
+    }
+}
+
 fn command_uses_credentials(command: &CommandPolicyConfig) -> bool {
     command
         .sandbox
@@ -4097,6 +4127,50 @@ mod tests {
         );
 
         assert!(nested_unsafe_seatbelt_rules(&policies).is_empty());
+    }
+
+    #[test]
+    fn clear_unsafe_seatbelt_rules_clears_command_from_and_intercept_sandboxes() {
+        let mut policies = CommandPoliciesConfig::default();
+        policies.commands.insert(
+            "git".to_string(),
+            CommandPolicyConfig {
+                sandbox: Some(CommandSandboxConfig {
+                    unsafe_macos_seatbelt_rules: vec!["(allow direct-sandbox)".to_string()],
+                    fs_read: vec!["/tmp".to_string()],
+                    ..CommandSandboxConfig::default()
+                }),
+                from: BTreeMap::from([(
+                    "session".to_string(),
+                    CommandFromConfig::Policy(Box::new(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow from-sandbox)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    })),
+                )]),
+                intercept: vec![InterceptRuleConfig {
+                    args: vec!["push".to_string()],
+                    action: InterceptActionConfig::Passthrough,
+                    sandbox: Some(CommandSandboxConfig {
+                        unsafe_macos_seatbelt_rules: vec!["(allow intercept-sandbox)".to_string()],
+                        ..CommandSandboxConfig::default()
+                    }),
+                }],
+                ..CommandPolicyConfig::default()
+            },
+        );
+
+        clear_unsafe_seatbelt_rules(&mut policies);
+
+        assert!(nested_unsafe_seatbelt_rules(&policies).is_empty());
+        // Structured overrides survive — only raw Seatbelt rules are cleared.
+        assert_eq!(
+            policies.commands["git"]
+                .sandbox
+                .as_ref()
+                .expect("sandbox")
+                .fs_read,
+            vec!["/tmp".to_string()]
+        );
     }
 
     #[test]
