@@ -217,9 +217,11 @@ nono's governance is designed to satisfy the requirements of the
 [OpenSSF Best Practices Badge](https://www.bestpractices.dev/en/projects/13332/passing)
 and to meet the sustainability expectations of the
 [Alpha-Omega project](https://alpha-omega.dev). The project currently holds
-the passing badge. The maintainer-council model, multi-organization maintainer
-table, documented succession path, and scheduled OSTIF security audit directly
-address the concerns raised during Alpha-Omega engagement.
+the passing badge. nono's maintainer council is currently single-organization, and the
+project is direct about that. The individual-not-corporate maintainership principle, 
+the documented succession path preventing employer veto, an open Reviewer-to-Maintainer
+pipeline for external contributors, and a scheduled OSTIF security audit are the concrete
+mechanisms addressing sustainability at an early stage. 
 
 The project's OpenSSF Scorecard results are available at:
 https://scorecard.dev/viewer/?uri=github.com/nolabs-ai/nono
